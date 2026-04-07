@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sleeping Monitor — CV Detection System</title>
+  <meta name="description" content="Real-time computer vision bed-fall detection simulation with configurable safe zones and interactive 3D human body manipulation.">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="app">
+    <!-- Canvas Area -->
+    <div id="canvasContainer">
+      <canvas id="simCanvas"></canvas>
+      <!-- Three.js 3D overlay — positioned exactly over the bed -->
+      <div id="threeOverlay"></div>
+      <div id="canvasOverlay">
+        <div id="monitorBadge">
+          <span class="pulse-dot"></span>
+          <span>MONITORING ACTIVE</span>
+        </div>
+        <div id="fpsCounter">-- FPS</div>
+      </div>
+    </div>
+
+    <!-- Control Panel -->
+    <aside id="controlPanel">
+      <!-- Title -->
+      <div class="panel-title">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 12s3-7 10-7 10 7 10 7-3 7-10 7-10-7-10-7z"/><circle cx="12" cy="12" r="3"/></svg>
+        <div>
+          <h1>Sleep Monitor</h1>
+          <p>CV Detection Engine v2.0</p>
+        </div>
+      </div>
+
+      <!-- Status Display -->
+      <section class="panel-section" id="statusSection">
+        <div id="statusBanner" class="status-safe">
+          <div id="statusIcon">●</div>
+          <div id="statusLabel">SAFE</div>
+        </div>
+      </section>
+
+      <!-- Body Part Status -->
+      <section class="panel-section">
+        <h2 class="section-title">Body Part Analysis</h2>
+        <div id="partGrid">
+          <div class="part-item" data-part="head"><span class="part-dot safe">●</span><span>Head</span></div>
+          <div class="part-item" data-part="torso"><span class="part-dot safe">●</span><span>Torso</span></div>
+          <div class="part-item" data-part="leftArm"><span class="part-dot safe">●</span><span>L. Arm</span></div>
+          <div class="part-item" data-part="rightArm"><span class="part-dot safe">●</span><span>R. Arm</span></div>
+          <div class="part-item" data-part="leftLeg"><span class="part-dot safe">●</span><span>L. Leg</span></div>
+          <div class="part-item" data-part="rightLeg"><span class="part-dot safe">●</span><span>R. Leg</span></div>
+      <!-- Bed Dimensions -->
+      <section class="panel-section">
+        <h2 class="section-title">Bed Dimensions</h2>
+        <div class="slider-group">
+          <label>Bed Width <span id="bedWVal">520</span>px</label>
+          <input type="range" id="bedWidth" min="300" max="800" value="520" step="10">
+        </div>
+        <div class="slider-group">
+          <label>Bed Height <span id="bedHVal">680</span>px</label>
+          <input type="range" id="bedHeight" min="400" max="1000" value="680" step="10">
+        </div>
+      </section>
+
+      <!-- Limb Controls -->
+      <section class="panel-section">
+        <h2 class="section-title">Limb Controls</h2>
+        <div class="slider-group">
+          <label>Left Arm Angle <span id="lArmVal">30</span>°</label>
+          <input type="range" id="lArmAngle" min="0" max="90" value="30">
+        </div>
+        <div class="slider-group">
+          <label>Right Arm Angle <span id="rArmVal">30</span>°</label>
+          <input type="range" id="rArmAngle" min="0" max="90" value="30">
+        </div>
+      </section>
+
+      <!-- Safe Zone Settings -->
+      <section class="panel-section">
+        <h2 class="section-title">Safe Zone Boundaries</h2>
+        <div class="slider-group">
+          <label>Left Margin <span id="leftVal">70</span>px</label>
+          <input type="range" id="leftMargin" min="20" max="160" value="70">
+        </div>
+        <div class="slider-group">
+          <label>Right Margin <span id="rightVal">70</span>px</label>
+          <input type="range" id="rightMargin" min="20" max="160" value="70">
+        </div>
+      </section>
+
+      <!-- Controls -->
+      <section class="panel-section">
+        <h2 class="section-title">Controls</h2>
+        <div class="mode-toggle">
+          <button id="bodyModeBtn" class="mode-btn active">🖐 Body</button>
+          <button id="limbModeBtn" class="mode-btn">🦾 Limb</button>
+        </div>
+        <div class="action-buttons">
+          <button id="autoSimBtn" class="btn btn-accent">▶ Auto Demo</button>
+          <button id="resetBtn" class="btn btn-secondary">↺ Reset</button>
+        </div>
+        <div class="action-buttons" style="margin-top:6px;">
+          <button id="simLeftBtn" class="btn btn-outline">← Drift Left</button>
+          <button id="simRightBtn" class="btn btn-outline">→ Drift Right</button>
+        </div>
+      </section>
+
+      <!-- Event Log -->
+      <section class="panel-section log-section">
+        <h2 class="section-title">Event Log</h2>
+        <div id="eventLog"></div>
+      </section>
+    </aside>
+  </div>
+
+  <!-- Three.js from CDN -->
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://cdn.jsdelivr.net/npm/three@0.162.0/build/three.module.js",
+      "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.162.0/examples/jsm/"
+    }
+  }
+  </script>
+  <script type="module" src="app.js"></script>
+</body>
+</html>
