@@ -5,18 +5,18 @@
 *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
 
 :root {
-  --bg-primary: #080c14;
-  --bg-panel: rgba(12, 18, 30, 0.92);
-  --bg-section: rgba(255, 255, 255, 0.03);
-  --border: rgba(255, 255, 255, 0.07);
-  --text-primary: #e0e6f0;
-  --text-secondary: #7a8ba8;
-  --text-muted: #4a5568;
-  --accent: #00d4ff;
-  --safe: #00ff88;
-  --warning: #ffaa00;
-  --danger: #ff3355;
-  --fallen: #ff0040;
+  --bg-primary: #f8fafc;
+  --bg-panel: #ffffff;
+  --bg-section: #f1f5f9;
+  --border: #e2e8f0;
+  --text-primary: #0f172a;
+  --text-secondary: #475569;
+  --text-muted: #94a3b8;
+  --accent: #2563eb;
+  --safe: #059669;
+  --warning: #ea580c;
+  --danger: #dc2626;
+  --fallen: #7f1d1d;
 }
 
 body {
@@ -32,13 +32,14 @@ body {
   display: flex;
   height: 100vh;
   width: 100vw;
+  background: #f8fafc;
 }
 
 /* ---- Canvas Area ---- */
 #canvasContainer {
   flex: 1;
   position: relative;
-  background: radial-gradient(ellipse at 40% 50%, #0f1520 0%, #080c14 100%);
+  background: #080c14; /* Deep neutral for grid contrast */
   overflow: hidden;
 }
 
