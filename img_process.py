@@ -200,6 +200,36 @@ _warn_flash = False
 _warn_flash_t = 0.0
 FLASH_INTERVAL = 0.4
 
+# Sticky warning state — persists until motion is detected back in safe zone
+sticky_warn = False
+sticky_msg  = ""
+
+# Cached trackbar values (used if Controls window is closed)
+_tb_left  = 100
+_tb_right = 300
+_tb_area  = 600
+
+
+def ensure_controls():
+    """Recreate the Controls window & trackbars if the user closed it."""
+    global _tb_left, _tb_right, _tb_area
+    try:
+        l = cv2.getTrackbarPos("LEFT  margin", "Controls")
+        r = cv2.getTrackbarPos("RIGHT margin", "Controls")
+        a = cv2.getTrackbarPos("MIN AREA",     "Controls")
+        # getTrackbarPos returns -1 on a dead window on some builds
+        if l < 0 or r < 0 or a < 0:
+            raise Exception("dead")
+        _tb_left, _tb_right, _tb_area = l, r, a
+    except Exception:
+        # Window was closed — recreate it with the last known values
+        cv2.namedWindow("Controls", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("Controls", 420, 130)
+        cv2.createTrackbar("LEFT  margin", "Controls", _tb_left,  WARP_SIZE, nothing)
+        cv2.createTrackbar("RIGHT margin", "Controls", _tb_right, WARP_SIZE, nothing)
+        cv2.createTrackbar("MIN AREA",     "Controls", _tb_area,  5000,      nothing)
+    return _tb_left, _tb_right, _tb_area
+
 # ---- Phase 2: Monitoring loop ----
 while True:
     ret, frame = cap.read()
@@ -226,10 +256,8 @@ while True:
     if key == ord('q'):
         break
 
-    # Read trackbars
-    LEFT_Z  = cv2.getTrackbarPos("LEFT  margin", "Controls")
-    RIGHT_Z = cv2.getTrackbarPos("RIGHT margin", "Controls")
-    MIN_AREA = cv2.getTrackbarPos("MIN AREA",    "Controls")
+    # Read trackbars (safe — recreates window if closed)
+    LEFT_Z, RIGHT_Z, MIN_AREA = ensure_controls()
     if LEFT_Z >= RIGHT_Z - 20:
         LEFT_Z = max(0, RIGHT_Z - 20)
 
@@ -253,8 +281,10 @@ while True:
     display = frame.copy()
     draw_safety_zones_on_frame(display, LEFT_Z, RIGHT_Z, M_inv)
 
-    any_warn = False
-    warn_msg = ""
+    motion_detected = False
+    motion_in_safe  = False
+    this_warn       = False
+    this_msg        = ""
 
     for cnt in cnts:
         if cv2.contourArea(cnt) < MIN_AREA:
@@ -262,14 +292,32 @@ while True:
         x, y, w, h = cv2.boundingRect(cnt)
         cx = x + w // 2
         is_warn = cx < LEFT_Z or cx > RIGHT_Z
+        motion_detected = True
         if is_warn:
-            any_warn = True
-            warn_msg = "<-- LEFT EDGE WARNING" if cx < LEFT_Z else "RIGHT EDGE WARNING -->"
+            this_warn = True
+            this_msg  = "<-- LEFT EDGE WARNING" if cx < LEFT_Z else "RIGHT EDGE WARNING -->"
+        else:
+            motion_in_safe = True
         draw_blob_on_frame(display, x, y, w, h, is_warn, M_inv)
+
+    # Sticky warning logic:
+    #   - Activate on motion in danger zone
+    #   - Clear ONLY when motion is detected in the safe zone
+    #   - Keep displaying if no motion at all (patient may have stopped at edge)
+    if this_warn:
+        sticky_warn = True
+        sticky_msg  = this_msg
+    elif motion_in_safe:
+        sticky_warn = False
+        sticky_msg  = ""
+    # else: no qualifying motion → keep previous sticky state
+
+    any_warn = sticky_warn
+    warn_msg = sticky_msg
 
     prev_gray_warp = gray_w
 
-    # ---- Warning flash ----
+    # ---- Warning flash (continuous blink while warning is active) ----
     now = time.time()
     if any_warn:
         if now - _warn_flash_t >= FLASH_INTERVAL:
@@ -280,14 +328,15 @@ while True:
 
     fh, fw = display.shape[:2]
 
-    # Blinking banner
-    if any_warn and _warn_flash:
+    # Solid red banner always visible when warning is active; blinks the text
+    if any_warn:
         ov = display.copy()
         cv2.rectangle(ov, (0, 0), (fw, 65), (0, 0, 200), -1)
         cv2.addWeighted(ov, 0.75, display, 0.25, 0, display)
-        tsz = cv2.getTextSize(warn_msg, cv2.FONT_HERSHEY_DUPLEX, 0.85, 2)[0]
-        cv2.putText(display, warn_msg, ((fw - tsz[0]) // 2, 45),
-                    cv2.FONT_HERSHEY_DUPLEX, 0.85, (255, 255, 255), 2)
+        if _warn_flash:   # only the text blinks, background stays solid
+            tsz = cv2.getTextSize(warn_msg, cv2.FONT_HERSHEY_DUPLEX, 0.85, 2)[0]
+            cv2.putText(display, warn_msg, ((fw - tsz[0]) // 2, 45),
+                        cv2.FONT_HERSHEY_DUPLEX, 0.85, (255, 255, 255), 2)
 
     # Status strip
     s_col  = (60, 220, 60) if not any_warn else (60, 60, 255)
