@@ -1,0 +1,28 @@
+{
+  "trained_at": "2026-04-17T10:01:03.456609",
+  "n_samples": 5173,
+  "n_test": 1294,
+  "accuracy": 86.71,
+  "classes": [
+    "DRIFT WARNING",
+    "FALL IMMINENT",
+    "STABLE"
+  ],
+  "features": [
+    "warp_x",
+    "warp_y",
+    "aspect_ratio",
+    "norm_x",
+    "norm_y",
+    "left_gap",
+    "right_gap",
+    "in_left",
+    "in_right",
+    "vx",
+    "vy",
+    "speed",
+    "ax"
+  ],
+  "model_type": "RandomForestClassifier",
+  "n_estimators": 200
+}

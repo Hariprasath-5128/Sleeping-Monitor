@@ -1,0 +1,60 @@
+{
+  "accuracy": 86.71,
+  "trained_at": "2026-04-17T10:01:03.456609",
+  "n_train": 5173,
+  "n_test": 1294,
+  "confusion_matrix": [
+    [
+      59,
+      22,
+      11
+    ],
+    [
+      37,
+      409,
+      25
+    ],
+    [
+      38,
+      39,
+      654
+    ]
+  ],
+  "class_labels": [
+    "DRIFT WARNING",
+    "FALL IMMINENT",
+    "STABLE"
+  ],
+  "per_class_metrics": {
+    "DRIFT WARNING": {
+      "precision": 0.4403,
+      "recall": 0.6413,
+      "f1-score": 0.5221,
+      "support": 92.0
+    },
+    "FALL IMMINENT": {
+      "precision": 0.8702,
+      "recall": 0.8684,
+      "f1-score": 0.8693,
+      "support": 471.0
+    },
+    "STABLE": {
+      "precision": 0.9478,
+      "recall": 0.8947,
+      "f1-score": 0.9205,
+      "support": 731.0
+    },
+    "macro avg": {
+      "precision": 0.7528,
+      "recall": 0.8014,
+      "f1-score": 0.7706,
+      "support": 1294.0
+    },
+    "weighted avg": {
+      "precision": 0.8835,
+      "recall": 0.8671,
+      "f1-score": 0.8735,
+      "support": 1294.0
+    }
+  }
+}
