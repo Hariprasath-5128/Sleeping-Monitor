@@ -12,7 +12,7 @@ from yolo_tracker import WhitenerTracker
 # -----------------------------
 # CONFIG
 # -----------------------------
-IP = "192.168.1.2"
+IP = "192.168.1.3"
 PORT = 8080
 URL = f"http://{IP}:{PORT}/video"
 
