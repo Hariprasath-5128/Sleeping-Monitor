@@ -5,6 +5,13 @@ import threading
 import os
 import sys
 
+"""
+top-left
+top-right
+bottom-right
+bottom-left
+"""
+
 # Add the sleeping-monitor folder to the path so yolo_tracker imports cleanly
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from yolo_tracker import WhitenerTracker
@@ -391,13 +398,16 @@ while True:
         # Inflate mask slightly so we track it if it falls just off the edge
         box_mask = cv2.dilate(box_mask, np.ones((50, 50), np.uint8))
 
-    if _fps_count % 3 == 0:
+    yolo_checked = (_fps_count % 3 == 0)
+    if yolo_checked:
         yolo_bbox = tracker.detect(frame, box_mask=box_mask)
     else:
         yolo_bbox = tracker.last_bbox_frame
 
-    if yolo_bbox is not None and smoothed_corners is not None:
+    if yolo_checked and yolo_bbox is not None and smoothed_corners is not None:
         tracker.update_warp(yolo_bbox, M, WARP_SIZE, LEFT_Z, RIGHT_Z)
+    elif yolo_checked and smoothed_corners is not None:
+        tracker.mark_no_detection(LEFT_Z, RIGHT_Z)
 
     # ---- Warning logic: YOLO-primary, motion-blob fallback ----
     # If YOLO detected the whitener recently, use its warp-space position directly.
@@ -467,8 +477,16 @@ while True:
                         cv2.FONT_HERSHEY_DUPLEX, 0.85, (255, 255, 255), 2)
 
     # Status strip
-    s_col  = (60, 220, 60) if not any_warn else (60, 60, 255)
-    s_text = "PATIENT SAFE" if not any_warn else "PATIENT AT RISK"
+    no_detection = tracker.risk_level == "NO ONE DETECTED"
+    if no_detection:
+        s_col = (180, 180, 180)
+        s_text = "NO ONE DETECTED"
+    elif any_warn:
+        s_col = (60, 60, 255)
+        s_text = "PATIENT AT RISK"
+    else:
+        s_col = (60, 220, 60)
+        s_text = "PATIENT SAFE"
     cv2.rectangle(display, (0, fh - 42), (fw, fh), (20, 20, 20), -1)
     cv2.putText(display, s_text,
                 (12, fh - 14), cv2.FONT_HERSHEY_DUPLEX, 0.8, s_col, 2)

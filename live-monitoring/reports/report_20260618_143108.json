@@ -1,0 +1,170 @@
+{
+  "predictions": {
+    "fall_probability": 0.031,
+    "time_to_fall_sec": null,
+    "next_state": "STABLE",
+    "risk_score": 0.013,
+    "future_vitals": [
+      [
+        343.3,
+        282.8
+      ],
+      [
+        343.3,
+        282.8
+      ],
+      [
+        343.3,
+        282.8
+      ],
+      [
+        343.3,
+        282.8
+      ],
+      [
+        343.3,
+        282.8
+      ]
+    ],
+    "sleep_quality_score": 0.974,
+    "confidence": 1.0
+  },
+  "ui": {
+    "cards": {
+      "fall_probability": "3.1%",
+      "time_to_fall": "N/A",
+      "risk_score": "0.01",
+      "sleep_quality": "97.4%"
+    },
+    "status": {
+      "current_state": "DRIFT WARNING",
+      "next_state": "STABLE",
+      "color": "green"
+    },
+    "charts": {
+      "historical": [
+        {
+          "x": 343.5,
+          "y": 281.7
+        },
+        {
+          "x": 343.0,
+          "y": 281.7
+        },
+        {
+          "x": 343.0,
+          "y": 281.7
+        },
+        {
+          "x": 343.0,
+          "y": 281.7
+        },
+        {
+          "x": 343.3,
+          "y": 282.8
+        },
+        {
+          "x": 343.3,
+          "y": 282.8
+        },
+        {
+          "x": 343.3,
+          "y": 282.8
+        },
+        {
+          "x": 343.5,
+          "y": 282.3
+        },
+        {
+          "x": 343.5,
+          "y": 282.3
+        },
+        {
+          "x": 343.5,
+          "y": 282.3
+        },
+        {
+          "x": 343.3,
+          "y": 282.6
+        },
+        {
+          "x": 343.3,
+          "y": 282.6
+        },
+        {
+          "x": 343.3,
+          "y": 282.6
+        },
+        {
+          "x": 343.0,
+          "y": 281.7
+        },
+        {
+          "x": 343.0,
+          "y": 281.7
+        },
+        {
+          "x": 343.0,
+          "y": 281.7
+        },
+        {
+          "x": 343.3,
+          "y": 282.0
+        },
+        {
+          "x": 343.3,
+          "y": 282.8
+        },
+        {
+          "x": 343.3,
+          "y": 282.8
+        },
+        {
+          "x": 343.3,
+          "y": 282.8
+        }
+      ],
+      "forecast": [
+        {
+          "x": 343.3,
+          "y": 282.8
+        },
+        {
+          "x": 343.3,
+          "y": 282.8
+        },
+        {
+          "x": 343.3,
+          "y": 282.8
+        },
+        {
+          "x": 343.3,
+          "y": 282.8
+        },
+        {
+          "x": 343.3,
+          "y": 282.8
+        }
+      ]
+    },
+    "alerts": {
+      "level": "none",
+      "message": "Patient is stable."
+    },
+    "model": {
+      "adaptive_learning": true,
+      "drift_detected": true,
+      "drift_intensity": 0.973,
+      "weights": {
+        "velocity": 0.243,
+        "acceleration": 0.343,
+        "position": 0.414
+      }
+    }
+  },
+  "_meta": {
+    "timestamp": "2026-06-18T14:31:08.902345",
+    "window_size": 40,
+    "total_rows": 7160
+  }
+}

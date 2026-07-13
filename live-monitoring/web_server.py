@@ -72,6 +72,8 @@ def _read_recent_rows(limit: int = HISTORY_LIMIT) -> list[dict]:
 
 def _risk_color_value(risk: str) -> float:
     risk = (risk or "").upper()
+    if "NO ONE" in risk or "NO DETECTION" in risk:
+        return 0.0
     if "FALL" in risk:
         return 1.0
     if "DRIFT" in risk:
@@ -112,11 +114,28 @@ def build_status_payload() -> dict:
     model = ui.get("model", {})
 
     risk_pred = latest.get("risk", "NO DATA")
+    no_detection = risk_pred.upper() == "NO ONE DETECTED"
     risk_score = predictions.get("risk_score", _risk_color_value(risk_pred))
     fall_probability = predictions.get("fall_probability", risk_score) * 100
     sleep_quality = predictions.get("sleep_quality_score", 0) * 100
     time_to_fall = predictions.get("time_to_fall_sec")
     on_edge, edge_side = _edge_info(latest)
+
+    if no_detection:
+        risk_score = 0.0
+        fall_probability = 0.0
+        sleep_quality = 0.0
+        time_to_fall = None
+        on_edge = False
+        edge_side = ""
+        predictions = {**predictions, "next_state": "NO ONE DETECTED", "confidence": 0}
+        ui = {
+            **ui,
+            "alerts": {
+                "level": "none",
+                "message": "No one detected in the monitored area.",
+            },
+        }
 
     forecast = [
         {"label": f"+{idx + 1}", "value": point[0] if isinstance(point, list) else point.get("x", 0)}

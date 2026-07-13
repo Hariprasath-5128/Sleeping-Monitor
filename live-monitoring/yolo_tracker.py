@@ -7,6 +7,7 @@ of the monitored surface (box / bed).
 
 Fall Risk Levels
 ----------------
+  NO ONE DETECTED -- No tracked object is visible in the monitored surface
   STABLE         -- Object is stationary in the safe zone
   DRIFT WARNING  -- Object is slowly moving toward an edge
   FALL IMMINENT  -- Fast movement or predicted position is in danger zone
@@ -39,14 +40,25 @@ MODEL_PATH  = "yolov8n.pt"   # auto-downloaded on first use (~6 MB)
 HISTORY_LEN = 45             # frames kept for trajectory analysis (≈1.5 s)
 PREDICT_AHEAD = 30           # frames ahead for fall prediction
 
+# Timestamp-based movement thresholds in warp pixels per second.
+MIN_HISTORY_FOR_RISK = 3
+RECENT_WINDOW_SEC = 1.5
+PREDICT_AHEAD_SEC = 1.2
+SLOW_DRIFT_PX_PER_SEC = 8.0
+FAST_DRIFT_PX_PER_SEC = 35.0
+MIN_DRIFT_DISPLACEMENT_PX = 4.0
+NEAR_EDGE_BUFFER_PX = 90.0
+
 RISK_STABLE   = "STABLE"
 RISK_DRIFT    = "DRIFT WARNING"
 RISK_IMMINENT = "FALL IMMINENT"
+RISK_NO_DETECTION = "NO ONE DETECTED"
 
 RISK_COLORS = {
     RISK_STABLE:   (60, 220, 60),
     RISK_DRIFT:    (0, 200, 255),
     RISK_IMMINENT: (0, 0, 255),
+    RISK_NO_DETECTION: (180, 180, 180),
 }
 # ──────────────────────────────────────────────────────────────────────
 
@@ -61,8 +73,9 @@ class WhitenerTracker:
 
         self.history: deque = deque(maxlen=HISTORY_LEN)  # (time, cx_warp, cy_warp, ar)
         self.last_bbox_frame = None  # (x1, y1, x2, y2) in original frame coords
-        self.risk_level = RISK_STABLE
+        self.risk_level = RISK_NO_DETECTION
         self.predicted_warp_pt = None
+        self._last_no_detection_log_t = 0.0
 
         # CSV setup
         self.csv_path = csv_path
@@ -148,22 +161,67 @@ class WhitenerTracker:
             "rz": right_z,
         }
         self.history.append(record)
-        self._log_csv(record)
         self._compute_risk(warp_size, left_z, right_z)
+        self._log_csv(record)
+
+    def mark_no_detection(self, left_z, right_z, log_interval=1.0):
+        """Set and periodically log the explicit no-object state."""
+        self.last_bbox_frame = None
+        self.predicted_warp_pt = None
+        self.risk_level = RISK_NO_DETECTION
+        self.history.clear()
+
+        now = time.time()
+        if now - self._last_no_detection_log_t < log_interval:
+            return
+
+        self._last_no_detection_log_t = now
+        self._log_csv({
+            "wx": -1.0,
+            "wy": -1.0,
+            "ar": 0.0,
+            "lz": left_z,
+            "rz": right_z,
+        })
 
     # ------------------------------------------------------------------
     # Fall / drift risk computation
     # ------------------------------------------------------------------
-    def _compute_risk(self, warp_size, left_z, right_z):
-        if len(self.history) < 5:
+    def _compute_risk_legacy_unused(self, warp_size, left_z, right_z):
+        if len(self.history) < MIN_HISTORY_FOR_RISK:
             self.risk_level = RISK_STABLE
             self.predicted_warp_pt = None
             return
 
-        pts = np.array([[r["wx"], r["wy"]] for r in self.history])
+        records = list(self.history)
+        latest = records[-1]
+        cur_x = latest["wx"]
+        cur_y = latest["wy"]
+        cur_t = latest["t"]
+
+        window_start = latest
+        for rec in reversed(records[:-1]):
+            window_start = rec
+            if cur_t - rec["t"] >= RECENT_WINDOW_SEC:
+                break
+
+        dt_window = max(cur_t - window_start["t"], 1e-3)
+        dx_window = cur_x - window_start["wx"]
+        dy_window = cur_y - window_start["wy"]
+        vx = dx_window / dt_window
+        vy = dy_window / dt_window
+        speed = float(np.hypot(vx, vy))
+        displacement = float(np.hypot(dx_window, dy_window))
+
+        prev = records[-2]
+        dt_inst = max(cur_t - prev["t"], 1e-3)
+        inst_dx = cur_x - prev["wx"]
+        inst_dy = cur_y - prev["wy"]
+        inst_speed = float(np.hypot(inst_dx / dt_inst, inst_dy / dt_inst))
+        speed = max(speed, inst_speed * 0.6)
 
         # --- Velocity (avg over last 10 frames) ---
-        recent = pts[-10:]
+        recent = []
         if len(recent) >= 2:
             vel = (recent[-1] - recent[0]) / (len(recent) - 1)   # px/frame
         else:
@@ -172,17 +230,14 @@ class WhitenerTracker:
         vel_x = vel[0]   # positive → moving right
 
         # Predicted position in PREDICT_AHEAD frames
-        pred = pts[-1] + vel * PREDICT_AHEAD
+        pred = np.array([cur_x + vx * PREDICT_AHEAD_SEC,
+                         cur_y + vy * PREDICT_AHEAD_SEC])
         self.predicted_warp_pt = tuple(pred.astype(int))
 
-        cur_x = pts[-1][0]
-
-        # Effective left boundary is shifted inward by the buffer
-        eff_left_z = left_z - LEFT_EDGE_BUFFER
-
         # Aspect ratio change rate
-        ars = [r["ar"] for r in self.history]
-        ar_rate = abs(ars[-1] - ars[0]) / max(len(ars), 1)
+        ars = [r["ar"] for r in records]
+        time_span = max(records[-1]["t"] - records[0]["t"], 1e-3)
+        ar_rate = abs(ars[-1] - ars[0]) / time_span
 
         # --- Risk classification ---
         # 1. Already in danger zone (note: uses eff_left_z on the left)
@@ -199,6 +254,75 @@ class WhitenerTracker:
         if in_danger or (pred_danger and abs(vel_x) > 2) or tilting:
             self.risk_level = RISK_IMMINENT
         elif pred_danger or fast_drift or (abs(vel_x) > 1.5):
+            self.risk_level = RISK_DRIFT
+        else:
+            self.risk_level = RISK_STABLE
+
+    def _compute_risk(self, warp_size, left_z, right_z):
+        """Classify risk from recent timestamped positions in warp-space."""
+        if len(self.history) < MIN_HISTORY_FOR_RISK:
+            self.risk_level = RISK_STABLE
+            self.predicted_warp_pt = None
+            return
+
+        records = list(self.history)
+        latest = records[-1]
+        cur_x = latest["wx"]
+        cur_y = latest["wy"]
+        cur_t = latest["t"]
+
+        window_start = latest
+        for rec in reversed(records[:-1]):
+            window_start = rec
+            if cur_t - rec["t"] >= RECENT_WINDOW_SEC:
+                break
+
+        dt_window = max(cur_t - window_start["t"], 1e-3)
+        dx_window = cur_x - window_start["wx"]
+        dy_window = cur_y - window_start["wy"]
+        vx = dx_window / dt_window
+        vy = dy_window / dt_window
+        avg_speed = float(np.hypot(vx, vy))
+        displacement = float(np.hypot(dx_window, dy_window))
+
+        prev = records[-2]
+        dt_inst = max(cur_t - prev["t"], 1e-3)
+        inst_vx = (cur_x - prev["wx"]) / dt_inst
+        inst_vy = (cur_y - prev["wy"]) / dt_inst
+        inst_speed = float(np.hypot(inst_vx, inst_vy))
+        speed = max(avg_speed, inst_speed * 0.6)
+
+        pred = np.array([cur_x + vx * PREDICT_AHEAD_SEC,
+                         cur_y + vy * PREDICT_AHEAD_SEC])
+        self.predicted_warp_pt = tuple(pred.astype(int))
+
+        ars = [r["ar"] for r in records]
+        time_span = max(records[-1]["t"] - records[0]["t"], 1e-3)
+        ar_rate = abs(ars[-1] - ars[0]) / time_span
+
+        center_x = (left_z + right_z) / 2.0
+        nearest_edge_dist = (cur_x - left_z) if cur_x < center_x else (right_z - cur_x)
+        in_danger = cur_x < left_z or cur_x > right_z
+        pred_danger = pred[0] < left_z or pred[0] > right_z
+        near_edge = nearest_edge_dist <= NEAR_EDGE_BUFFER_PX
+
+        moving_left = vx < -SLOW_DRIFT_PX_PER_SEC
+        moving_right = vx > SLOW_DRIFT_PX_PER_SEC
+        moving_toward_left_edge = cur_x < center_x and moving_left
+        moving_toward_right_edge = cur_x >= center_x and moving_right
+        moving_toward_edge = moving_toward_left_edge or moving_toward_right_edge
+
+        slow_drift = (
+            speed >= SLOW_DRIFT_PX_PER_SEC and
+            displacement >= MIN_DRIFT_DISPLACEMENT_PX
+        )
+        fast_drift = speed >= FAST_DRIFT_PX_PER_SEC
+        fast_edge_drift = fast_drift and moving_toward_edge and near_edge
+        tilting = ar_rate > 0.20
+
+        if in_danger or fast_edge_drift or (pred_danger and moving_toward_edge) or tilting:
+            self.risk_level = RISK_IMMINENT
+        elif pred_danger or fast_drift or slow_drift:
             self.risk_level = RISK_DRIFT
         else:
             self.risk_level = RISK_STABLE
@@ -260,7 +384,7 @@ class WhitenerTracker:
         bar_x    = fw - 18
         bar_top  = 55
         bar_bot  = bar_top + bar_h
-        risk_map = {RISK_STABLE: 0, RISK_DRIFT: 0.55, RISK_IMMINENT: 1.0}
+        risk_map = {RISK_NO_DETECTION: 0, RISK_STABLE: 0, RISK_DRIFT: 0.55, RISK_IMMINENT: 1.0}
         fill_frac = risk_map.get(self.risk_level, 0)
         fill_y   = int(bar_bot - fill_frac * bar_h)
         cv2.rectangle(canvas, (bar_x, bar_top), (bar_x + 12, bar_bot), (50, 50, 50), -1)

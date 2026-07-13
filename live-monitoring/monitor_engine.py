@@ -101,6 +101,8 @@ class AdaptiveMonitorEngine:
         parsed = []
         for r in new_rows:
             try:
+                if r.get("risk", "").upper() == "NO ONE DETECTED":
+                    continue
                 parsed.append({
                     "t":   r.get("timestamp", ""),
                     "wx":  float(r.get("warp_x", 0)),
