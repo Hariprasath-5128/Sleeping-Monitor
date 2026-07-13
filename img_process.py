@@ -9,7 +9,7 @@ from datetime import datetime
 # ─────────────────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────────────────
-IP   = "192.168.1.2"
+IP   = "10.144.219.160"
 PORT = 8080
 URL  = f"http://{IP}:{PORT}/video"
 
@@ -20,11 +20,19 @@ LOG_FILE       = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                               "position_log.csv")
 FLASH_INTERVAL = 0.4    # warning blink period (s)
 LOST_TIMEOUT   = 60     # frames without a detection before re-acquiring
+NOT_FOUND_TIMEOUT = 30  # frames lost before declaring NOT FOUND
 
-# YOLOv8 — yolov8s gives the best speed/accuracy tradeoff on an RTX 2050
+# Zone smoothing — only commit to a new zone if it appears in majority of last N frames
+ZONE_SMOOTH_N  = 8      # rolling window size
+
+# Dual-Model System
+# 1. Visual tracking model (draws the box)
 YOLO_MODEL     = "yolov8s.pt"
-YOLO_CONF      = 0.20   # low threshold — whitener may score lower than 'person'
-YOLO_IOU       = 0.45   # NMS IoU threshold
+YOLO_CONF      = 0.20   
+YOLO_IOU       = 0.45   
+
+# 2. State classification model (acts as the brain to decide safe/danger)
+STATE_MODEL    = "runs/classify/runs/classify/sleeping_monitor/weights/best.pt"
 
 # ─────────────────────────────────────────────────────────
 # CORNER-SELECTION GLOBALS
@@ -133,7 +141,7 @@ def run_corner_selection(first_frame, cap_ref):
 
 
 # ─────────────────────────────────────────────────────────
-# ZONE OVERLAY
+# ZONE OVERLAY (Visual Only now)
 # ─────────────────────────────────────────────────────────
 def draw_zones(canvas, lz, rz, M_inv):
     """Draw strong, clearly visible safety zone overlays on the full frame."""
@@ -159,23 +167,14 @@ def draw_zones(canvas, lz, rz, M_inv):
         # Bright core
         cv2.line(canvas, tuple(t), tuple(b), (0, 220, 255), 3, cv2.LINE_AA)
 
-    # ── Zone labels — large, bold, with dark background box ──
-    for xw_mid, label, col in [
-        (lz // 2,        "DANGER", (80, 80, 255)),
-        ((rz + W) // 2,  "DANGER", (80, 80, 255)),
-        ((lz + rz) // 2, "SAFE",   (80, 255, 120)),
-    ]:
-        pt = warp_to_frame([[xw_mid, H // 2]], M_inv)[0]
-        font  = cv2.FONT_HERSHEY_DUPLEX
-        scale = 0.75
-        thick = 2
-        (tw, th), _ = cv2.getTextSize(label, font, scale, thick)
-        lx = pt[0] - tw // 2
-        ly = pt[1] + th // 2
-        # Dark backing rectangle
-        cv2.rectangle(canvas, (lx - 6, ly - th - 6), (lx + tw + 6, ly + 6),
-                      (15, 15, 15), -1)
-        cv2.putText(canvas, label, (lx, ly), font, scale, col, thick, cv2.LINE_AA)
+    # ── Left / Right Text Markers ──
+    l_mid = warp_to_frame([[lz // 2, H // 2]], M_inv)[0]
+    r_mid = warp_to_frame([[(rz + W) // 2, H // 2]], M_inv)[0]
+    
+    cv2.putText(canvas, "<-- LEFT", (l_mid[0]-40, l_mid[1]), cv2.FONT_HERSHEY_DUPLEX, 0.8, (0,0,0), 4, cv2.LINE_AA)
+    cv2.putText(canvas, "<-- LEFT", (l_mid[0]-40, l_mid[1]), cv2.FONT_HERSHEY_DUPLEX, 0.8, (0, 200, 255), 2, cv2.LINE_AA)
+    cv2.putText(canvas, "RIGHT -->", (r_mid[0]-40, r_mid[1]), cv2.FONT_HERSHEY_DUPLEX, 0.8, (0,0,0), 4, cv2.LINE_AA)
+    cv2.putText(canvas, "RIGHT -->", (r_mid[0]-40, r_mid[1]), cv2.FONT_HERSHEY_DUPLEX, 0.8, (0, 200, 255), 2, cv2.LINE_AA)
 
     # ── Bed / box outline — bright cyan, thick ──
     box_w = np.array([[0,0],[W,0],[W,H],[0,H]], dtype="float32")
@@ -196,10 +195,22 @@ def draw_person(canvas, bx, by, bw, bh, cx_w, cy_w,
         box_col  = (0, 200, 255)
         text_col = (0, 200, 255)
         status   = "SEARCHING..."
+    elif zone == "NOT_FOUND":
+        box_col  = (0, 100, 255)
+        text_col = (0, 100, 255)
+        status   = "NOT FOUND"
     elif zone == "SAFE":
         box_col  = (0, 255, 80)
         text_col = (0, 220, 80)
         status   = "SAFE"
+    elif zone == "WARNING":
+        box_col  = (0, 220, 255)
+        text_col = (0, 200, 255)
+        status   = "WARNING"
+    elif zone == "EMPTY":
+        box_col  = (150, 150, 150)
+        text_col = (150, 150, 150)
+        status   = "EMPTY"
     else:
         box_col  = (0, 60, 255)
         text_col = (60, 60, 255)
@@ -229,8 +240,6 @@ def draw_person(canvas, bx, by, bw, bh, cx_w, cy_w,
     for corner, nb1, nb2 in [(tl, tr, bl), (tr, tl, br), (br, tr, bl), (bl, tl, br)]:
         cv2.line(canvas, corner, lerp(corner, nb1, t), box_col, 4, cv2.LINE_AA)
         cv2.line(canvas, corner, lerp(corner, nb2, t), box_col, 4, cv2.LINE_AA)
-
-    # (YOLO class label hidden — only boundary box is shown)
 
     # Centroid in frame space
     cx_f, cy_f = warp_to_frame([[cx_w, cy_w]], M_inv)[0]
@@ -324,20 +333,23 @@ def log_row(writer, fh, frame_no, tid, cls_name, conf,
 # MAIN
 # ─────────────────────────────────────────────────────────
 
-# --- Load YOLOv8 (runs on GPU automatically if CUDA available) ---
 print("=" * 58)
-print("  Hospital Bed / Patient Monitor  — YOLOv8 tracking")
+print("  Hospital Bed / Patient Monitor  — Dual Model AI")
 print("=" * 58)
-print("  Loading YOLOv8s model …")
+print("  Loading AI models …")
 
-from ultralytics import YOLO  # import here so startup message prints first
-model = YOLO(YOLO_MODEL)
-
-# Force GPU if available
+from ultralytics import YOLO
 import torch
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"  Running on: {device.upper()}")
+
+print("  Loading Visual Tracker...")
+model = YOLO(YOLO_MODEL)
 model.to(device)
+
+print("  Loading State Classifier (The Brain)...")
+state_model = YOLO(STATE_MODEL)
+state_model.to(device)
 
 # ── Camera ──
 cap = cv2.VideoCapture(URL)
@@ -373,6 +385,10 @@ lost_frames  = 0
 sticky_warn  = False
 sticky_msg   = ""
 sticky_zone  = "SAFE"
+
+# Zone smoothing buffer
+from collections import Counter
+zone_history = []
 
 fps          = 0.0
 _fps_t0      = time.time()
@@ -437,14 +453,22 @@ while True:
     if LZ >= RZ - 30:
         LZ = max(0, RZ - 30)
 
-    # ── Warp to bird's-eye (internal — YOLO runs here) ──
-    # Running YOLO on the warped frame means it ONLY detects objects
-    # inside the defined boundary — the "no detection outside boundary" feature.
+    # ── Warp to bird's-eye ──
     warped = cv2.warpPerspective(frame, M, (WARP_SIZE, WARP_SIZE))
 
-    # ── YOLOv8 tracking ──
-    # persist=True keeps track IDs stable across frames
-    # verbose=False suppresses per-frame console output
+    # ── 1. Classification Brain ──
+    state_res = state_model.predict(warped, verbose=False, device=device)
+    top1_idx = state_res[0].probs.top1
+    raw_zone = state_model.names[top1_idx].upper()
+
+    # Majority-vote smoothing: only commit if dominant in last N frames
+    zone_history.append(raw_zone)
+    if len(zone_history) > ZONE_SMOOTH_N:
+        zone_history.pop(0)
+    zone_counts = Counter(zone_history)
+    current_zone = zone_counts.most_common(1)[0][0]
+
+    # ── 2. YOLOv8 Visual Tracking ──
     results = model.track(warped,
                           persist=True,
                           conf=conf_thresh,
@@ -455,14 +479,13 @@ while True:
     display = frame.copy()
     draw_zones(display, LZ, RZ, M_inv)
 
-    # ── Parse YOLO results ──
-    # Collect all detections with valid track IDs
+    # ── Parse YOLO tracking results ──
     detections = []
     if results and results[0].boxes is not None:
         boxes = results[0].boxes
         if boxes.id is not None:
             ids   = boxes.id.cpu().numpy().astype(int)
-            xywhs = boxes.xywh.cpu().numpy()          # cx, cy, w, h (warp-space pixels)
+            xywhs = boxes.xywh.cpu().numpy()
             confs = boxes.conf.cpu().numpy()
             clss  = boxes.cls.cpu().numpy().astype(int)
             for i in range(len(ids)):
@@ -479,10 +502,6 @@ while True:
                     "class": model.names[clss[i]],
                 })
 
-    # ── ID Locking ──
-    # If we have a locked target, prefer that track ID.
-    # If locked ID is gone, pick the highest-confidence detection to re-lock.
-    # This ensures the whitener box never jumps to another object.
     chosen = None
     if locked_id is not None:
         for d in detections:
@@ -491,22 +510,16 @@ while True:
                 break
 
     if chosen is None and detections:
-        # Acquire / re-acquire: pick highest confidence detection
         chosen     = max(detections, key=lambda d: d["conf"])
         locked_id  = chosen["id"]
         lost_frames = 0
-        print(f"  Locked onto track ID={locked_id} "
-              f"({chosen['class']} @ {chosen['conf']:.0%})")
-
-    # ── Update state from chosen detection ──
-    current_zone = sticky_zone
+        print(f"  Locked onto track ID={locked_id} ({chosen['class']} @ {chosen['conf']:.0%})")
 
     if chosen is not None:
         bx, by, bw, bh = chosen["bbox"]
         cx_w  = chosen["cx"]
         cy_w  = chosen["cy"]
 
-        # Clamp to warp canvas
         bx = max(0, min(bx, WARP_SIZE - 1))
         by = max(0, min(by, WARP_SIZE - 1))
         bw = min(bw, WARP_SIZE - bx)
@@ -514,7 +527,6 @@ while True:
         cx_w = max(0, min(cx_w, WARP_SIZE - 1))
         cy_w = max(0, min(cy_w, WARP_SIZE - 1))
 
-        # Light EMA smoothing
         if last_cx_w is not None:
             cx_w = int(0.8 * cx_w + 0.2 * last_cx_w)
             cy_w = int(0.8 * cy_w + 0.2 * last_cy_w)
@@ -527,22 +539,6 @@ while True:
         lost_frames  = 0
 
         trail.append((cx_w, cy_w))
-
-        # ── Zone classification: overlap percentage threshold ──
-        # Only trigger DANGER when ≥25% of the box width is inside a danger zone.
-        # This prevents a minor/accidental edge overlap from firing a false alarm.
-        DANGER_OVERLAP_THRESH = 0.35   # 35 % of box width must be inside danger zone
-
-        left_overlap  = max(0, LZ - bx)          # pixels of box inside LEFT danger zone
-        right_overlap = max(0, (bx + bw) - RZ)   # pixels of box inside RIGHT danger zone
-        box_width     = max(bw, 1)
-
-        if left_overlap / box_width >= DANGER_OVERLAP_THRESH:
-            current_zone = "LEFT"
-        elif right_overlap / box_width >= DANGER_OVERLAP_THRESH:
-            current_zone = "RIGHT"
-        else:
-            current_zone = "SAFE"
 
         draw_person(display, bx, by, bw, bh, cx_w, cy_w,
                     current_zone, trail, M_inv,
@@ -558,37 +554,44 @@ while True:
                     cx_w, cy_w, cx_f, cy_f,
                     current_zone, sticky_warn)
 
-        # Sticky warning
-        if current_zone in ("LEFT", "RIGHT"):
-            sticky_warn = True
-            sticky_msg  = ("<-- ABOUT TO FALL LEFT"
-                           if current_zone == "LEFT"
-                           else "ABOUT TO FALL RIGHT -->")
-            sticky_zone = current_zone
-        else:
-            sticky_warn = False
-            sticky_msg  = ""
-            sticky_zone = "SAFE"
-
     else:
-        # No matching detection — show last known position
         lost_frames += 1
         tracking_ok  = False
-
         if lost_frames >= LOST_TIMEOUT:
-            locked_id = None          # fully re-acquire next time
+            locked_id = None
             lost_frames = 0
-            print("  Target lost — re-acquiring …")
+
+        # After NOT_FOUND_TIMEOUT frames, override zone to NOT_FOUND
+        if lost_frames >= NOT_FOUND_TIMEOUT:
+            current_zone = "NOT_FOUND"
+            zone_history.clear()   # flush smoothing buffer so it reacts fast on re-detection
 
         if last_bbox_w is not None:
             bx, by, bw, bh = last_bbox_w
             draw_person(display, bx, by, bw, bh,
-                        last_cx_w, last_cy_w, sticky_zone,
+                        last_cx_w, last_cy_w,
+                        "SEARCHING" if lost_frames < NOT_FOUND_TIMEOUT else "NOT_FOUND",
                         trail, M_inv, is_searching=True,
                         label=last_label.upper())
 
+    # Sticky warning logic from classification
+    if current_zone in ("DANGER_LEFT", "DANGER_RIGHT", "WARNING", "NOT_FOUND"):
+        sticky_warn = True
+        if current_zone == "DANGER_LEFT":
+            sticky_msg = "<-- ABOUT TO FALL LEFT"
+        elif current_zone == "DANGER_RIGHT":
+            sticky_msg = "ABOUT TO FALL RIGHT -->"
+        elif current_zone == "NOT_FOUND":
+            sticky_msg = "!! OBJECT NOT FOUND — MAY HAVE FALLEN !!"
+        else:
+            sticky_msg = "WARNING: NEAR EDGE"
+        sticky_zone = current_zone
+    else:
+        sticky_warn = False
+        sticky_msg  = ""
+        sticky_zone = current_zone
+
     # ── Flash timer ──
-    now = time.time()
     if sticky_warn:
         if now - flash_t >= FLASH_INTERVAL:
             flash_on = not flash_on
@@ -613,9 +616,22 @@ while True:
                         cv2.FONT_HERSHEY_DUPLEX, 0.95, (255,255,255), 2, cv2.LINE_AA)
 
     # ── Zone badge (top-right) ──
-    badge_text = ("STABLE" if sticky_zone == "SAFE"
-                  else f"DANGER  ({sticky_zone} EDGE)")
-    badge_col  = (0, 210, 80) if sticky_zone == "SAFE" else (60, 60, 255)
+    if sticky_zone == "SAFE":
+        badge_text = "STABLE"
+        badge_col  = (0, 210, 80)
+    elif sticky_zone == "EMPTY":
+        badge_text = "EMPTY BED"
+        badge_col  = (150, 150, 150)
+    elif sticky_zone == "WARNING":
+        badge_text = "WARNING"
+        badge_col  = (0, 200, 255)
+    elif sticky_zone == "NOT_FOUND":
+        badge_text = "NOT FOUND"
+        badge_col  = (0, 100, 255)   # orange-red
+    else:
+        badge_text = f"DANGER ({sticky_zone})"
+        badge_col  = (60, 60, 255)
+
     bsz = cv2.getTextSize(badge_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)[0]
     bx0 = fw_d - bsz[0] - 20; by0 = 12
     cv2.rectangle(display, (bx0 - 6, by0),
@@ -637,9 +653,15 @@ while True:
                 cv2.FONT_HERSHEY_SIMPLEX, 0.55, ts_col, 2, cv2.LINE_AA)
 
     # ── Status bar ──
-    s_text = ("PATIENT SAFE" if not sticky_warn
-              else "!! PATIENT AT RISK — ABOUT TO FALL !!")
-    s_col  = (50, 220, 50) if not sticky_warn else (60, 60, 255)
+    if not sticky_warn:
+        s_text = "PATIENT SAFE"
+        s_col  = (50, 220, 50)
+    elif sticky_zone == "NOT_FOUND":
+        s_text = "OBJECT NOT FOUND — MAY HAVE FALLEN OFF BED"
+        s_col  = (0, 100, 255)
+    else:
+        s_text = "!! PATIENT AT RISK — ABOUT TO FALL !!"
+        s_col  = (60, 60, 255)
     cv2.rectangle(display, (0, fh_d - 44), (fw_d, fh_d), (20,20,20), -1)
     cv2.putText(display, s_text, (12, fh_d - 14),
                 cv2.FONT_HERSHEY_DUPLEX, 0.75, s_col, 2, cv2.LINE_AA)

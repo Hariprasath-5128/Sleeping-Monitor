@@ -1,0 +1,14 @@
+# Datasets
+dataset/
+dataset_split/
+
+# YOLO Runs & Weights
+runs/
+*.pt
+
+# Python caches
+__pycache__/
+*.pyc
+
+# Logs
+position_log.csv
