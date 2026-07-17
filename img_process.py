@@ -9,7 +9,7 @@ from datetime import datetime
 # ─────────────────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────────────────
-IP   = "10.144.219.160"
+IP   = "WIFI IP ADDRESS HERE"
 PORT = 8080
 URL  = f"http://{IP}:{PORT}/video"
 
