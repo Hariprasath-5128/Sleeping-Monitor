@@ -5,3 +5,14 @@ __pycache__/
 
 # Logs
 position_log.csv
+
+# Runtime status published by img_process.py
+status.json
+status.json.tmp
+status.txt
+
+# Federated learning local store
+fl_store/
+
+live_frame.jpg
+live_frame.jpg.tmp

@@ -1,0 +1,539 @@
+===============================================================================
+  SLEEPING MONITOR - STEP BY STEP RUN GUIDE
+  ESP32-CAM (streaming) + ESP32 (motors) + Python pipeline + Federated Learning
+===============================================================================
+
+  All commands assume you start in:   C:\Projects\sleeping-monitor
+  Open a normal Command Prompt (cmd) or PowerShell in that folder.
+
+  You will need 2 terminals for the basic run (3 and 4 only for federated
+  learning). Keep each one open - do not close them while running.
+
+
+===============================================================================
+  QUICK START - THE SHORT VERSION
+===============================================================================
+
+  Everything already flashed and unchanged since last time? Do just this:
+
+    1. Turn ON the "Hariprasath LAPTOP" hotspot.
+    2. Power the ESP32-CAM and the motor ESP32.
+    3. Close any browser tab showing the camera stream (:81/stream).
+
+    4. Terminal 1:    cd C:\Projects\sleeping-monitor
+                      python app.py
+
+    5. Terminal 2:    cd C:\Projects\sleeping-monitor
+                      python img_process.py
+
+    6. Click the 4 bed corners:   TL -> TR -> BR -> BL
+       (top-left, top-right, bottom-right, bottom-left - clockwise)
+
+    7. Open in a browser:   http://192.168.137.1:5000/live
+
+    To stop:  press  q  in the Bed Monitor window, then Ctrl+C in each
+              terminal.
+
+
+  HOW THE PIECES FIT TOGETHER
+
+    ESP32-CAM  --video-->  img_process.py  --zone-->  app.py  (port 5000)
+                                                        |
+                                                GET /status every 2 s
+                                                        v
+                                                 ESP32 + servos
+
+    The camera only streams. img_process.py does the thinking (YOLO finds
+    the object, the trained classifier decides the risk). app.py holds the
+    answer. The motor ESP32 asks app.py every 2 seconds and moves the
+    servos to match.
+
+
+  THE 3 VALUES THAT MUST BE RIGHT
+
+    img_process.py       CAM_IP     = "192.168.137.99"   <- the camera
+    motor_testing.ino    SERVER_IP  = "192.168.137.1"    <- your PC
+    both .ino files      WIFI_SSID  = "Hariprasath LAPTOP"
+
+    The camera's IP CHANGES whenever it reboots. If nothing works, check
+    that first - see Step 0.
+
+
+  IF SOMETHING IS WRONG
+
+    Nothing at :5000/live      app.py must start BEFORE img_process.py,
+                               and you must finish clicking the 4 corners.
+
+    Motors never move          Check http://192.168.137.1:5000/status
+                               "stale":true means img_process.py is not
+                               publishing. Also verify SERVER_IP.
+
+    "SEARCHING" forever        Lower the CONF % slider to 8-10,
+                               or press  t  to reset the tracker.
+
+    Camera unreachable         Power-cycle it, then find its new IP
+                               (Step 0) and update CAM_IP.
+
+  Full detail and everything else is in the numbered steps below.
+
+
+===============================================================================
+  STEP 0 - CHECK THE PLACEHOLDERS BEFORE ANYTHING ELSE
+===============================================================================
+
+  Run this to print every value that must be correct:
+
+      cd C:\Projects\sleeping-monitor
+      findstr /N /C:"CAM_IP" img_process.py
+      findstr /N /C:"SERVER_IP" esp\motor_testing\motor_testing.ino
+      findstr /N /C:"WIFI_SSID" esp\live_monitor\live_monitor.ino esp\motor_testing\motor_testing.ino
+
+  Expected values right now:
+
+      img_process.py      CAM_IP     = "192.168.137.99"
+      motor_testing.ino   SERVER_IP  = "192.168.137.1"
+      both .ino files     WIFI_SSID  = "Hariprasath LAPTOP"
+
+  Find your PC's IP address (needed for SERVER_IP):
+
+      ipconfig
+
+  Look for the adapter on the SAME network as the ESPs.
+  When the "Hariprasath LAPTOP" hotspot is ON, your PC is 192.168.137.1
+
+  >> IMPORTANT <<
+  The hotspot must be STARTED FIRST, before powering either ESP32.
+  If the hotspot is off, 192.168.137.1 does not exist and the motor
+  ESP32 can never reach the server. Both ESPs look for the WiFi at
+  boot; if it is not there they retry and reboot.
+
+  Windows hotspot:  Settings > Network & Internet > Mobile hotspot > On
+
+  >> THE CAMERA IP CHANGES <<
+  The hotspot hands out addresses by DHCP, so the ESP32-CAM gets a
+  different IP each time it reboots or reconnects. If nothing works,
+  check the camera's IP FIRST. Two ways to find it:
+
+    a) Serial Monitor at 115200 - the camera prints its IP at boot.
+
+    b) List the devices currently on the hotspot:
+
+           arp -a 192.168.137.1
+
+       You will see 2 entries (plus the .255 broadcast): the camera and
+       the motor ESP32. To tell them apart, ask each one for a picture -
+       only the camera answers:
+
+           curl -s -o NUL -w "%%{http_code} %%{size_download}\n" http://192.168.137.XX/capture
+
+       The camera replies  200  with several thousand bytes.
+       The motor ESP32 has no web server and just times out.
+
+  Then put that IP into img_process.py line 16, or set it per-run:
+
+           set CAM_IP=192.168.137.XX
+
+
+===============================================================================
+  STEP 1 - FLASH THE ESP32-CAM (camera / streaming)
+===============================================================================
+
+  1. Turn ON the "Hariprasath LAPTOP" hotspot first.
+
+  2. Arduino IDE - open:
+         C:\Projects\sleeping-monitor\esp\live_monitor\live_monitor.ino
+
+  3. Tools menu settings:
+         Board       : "AI Thinker ESP32-CAM"
+         PSRAM       : Enabled
+         Upload Speed: 115200
+         Port        : your COM port
+
+  4. Connect GPIO0 to GND  (required to flash), then press RESET.
+
+  5. Click Upload.
+
+  6. Disconnect GPIO0 from GND, press RESET again.
+
+  7. Open Serial Monitor at 115200 baud. You should see:
+
+         Camera ready.
+         PSRAM detected: yes
+         Connected! Camera IP: 192.168.137.XX      <-- WRITE THIS DOWN
+         Stream URL  -> http://192.168.137.XX:81/stream
+         Control server started on port 80.
+         Stream server started on port 81.
+
+     If instead you see:
+         [HTTP] STREAM SERVER FAILED TO START: 0x...
+     that is OK - the pipeline automatically falls back to single-frame
+     capture on port 80. It will just run at a lower frame rate.
+
+  8. If the IP is NOT 192.168.137.99, update it:
+
+         notepad img_process.py
+         (line 16)  CAM_IP = os.environ.get("CAM_IP", "192.168.137.XX")
+
+     Or leave the file alone and set it per-run:
+
+         set CAM_IP=192.168.137.XX
+
+  9. Verify in a browser before continuing:
+
+         http://192.168.137.XX/
+
+     You should see the camera page with a live image.
+     >> Then CLOSE that browser tab. <<
+     The ESP32-CAM serves only ONE stream client at a time - if the
+     browser holds it, img_process.py cannot get the video.
+
+
+===============================================================================
+  STEP 2 - START THE STATUS SERVER  (Terminal 1)
+===============================================================================
+
+      cd C:\Projects\sleeping-monitor
+      python app.py
+
+  Expected output:
+
+      Listening on http://0.0.0.0:5000
+      ESP32 polls   http://<YOUR_PC_IP>:5000/status
+      Live view     http://<YOUR_PC_IP>:5000/live
+
+  LEAVE THIS TERMINAL RUNNING for the whole session.
+
+  Start this BEFORE img_process.py - the monitor pushes its video frames
+  here, and the motor ESP32 reads its commands from here.
+
+  Quick check in a browser:   http://127.0.0.1:5000/status
+  It should show  "status":"STALE"  for now (nothing publishing yet).
+
+  If Windows Firewall pops up, click ALLOW on Private networks,
+  otherwise the ESP32 cannot reach port 5000.
+
+
+===============================================================================
+  STEP 3 - FLASH THE MOTOR ESP32  (different board from the camera)
+===============================================================================
+
+  1. Arduino IDE - open:
+         C:\Projects\sleeping-monitor\esp\motor_testing\motor_testing.ino
+
+  2. Tools menu:
+         Board : "ESP32 Dev Module"
+         Port  : your COM port
+
+  3. Wiring:
+         Servo 1 signal -> GP18
+         Servo 2 signal -> GP19
+         Servos need their OWN 5V supply (not the ESP32 5V pin).
+         Connect all grounds together.
+
+  4. Library needed: ESP32Servo only.
+     (ArduinoJson is NOT required - the sketch parses the reply itself.)
+
+  5. Upload, then open Serial Monitor at 115200:
+
+         Servos at start positions.
+         Connected! ESP32 IP: 192.168.137.YY
+         Polling server every 2 s...
+         Zone: STALE
+
+     "Zone: STALE" is CORRECT at this point - img_process.py is not
+     running yet, so there is no fresh reading and the servos correctly
+     stay parked at their start positions.
+
+     If you see "[HTTP] Error code: -1" repeatedly, then SERVER_IP is
+     wrong or the firewall is blocking port 5000. Recheck Step 0.
+
+  Servo behaviour (unchanged from the original motor_testing.ino):
+         SERVO1_START = 1000 us  (GP18)
+         SERVO2_START = 1500 us  (GP19)
+         TRAVEL_MAX   = 800 us
+         3 second settle at start
+
+
+===============================================================================
+  STEP 4 - START THE MONITOR  (Terminal 2)
+===============================================================================
+
+  Open a SECOND terminal (leave app.py running in the first):
+
+      cd C:\Projects\sleeping-monitor
+      python img_process.py
+
+  Expected startup:
+
+      Running on: CUDA
+      Loading Visual Tracker: yolov8s.pt
+      Loading Risk Classifier (The Brain): risk_classifier.pkl
+      Classes: ['DRIFT WARNING', 'FALL IMMINENT', 'STABLE']
+      Opening ESP32-CAM stream: http://192.168.137.99:81/stream
+      ESP32-CAM stream is live.
+
+  If port 81 is not working you will see this instead, which is FINE:
+
+      No MJPEG server on 192.168.137.99:81 - skipping it.
+      Trying single-frame capture: http://192.168.137.99/capture
+      ESP32-CAM /capture is live - polling single frames.
+
+  To force the capture fallback on purpose:
+
+      set CAM_PORT=80
+      python img_process.py
+
+
+===============================================================================
+  STEP 5 - PICK THE 4 BED CORNERS
+===============================================================================
+
+  A window titled "Select 4 Corners" opens with the live camera feed.
+  Nothing else happens until you finish this.
+
+  WHAT IT DOES
+    You are telling the system where the bed is. These 4 points define a
+    perspective warp that flattens your angled camera view into a
+    straight-down "bird's-eye" view. Every zone decision is made in that
+    flattened space - if the corners are wrong, every zone is wrong.
+
+  CLICK IN THIS EXACT ORDER (clockwise, starting top-left):
+
+         TL --------------> TR
+          ^                  |
+          |    (the bed)     |
+          |                  v
+         BL <-------------- BR
+
+         1. TL  = top-left corner of the bed
+         2. TR  = top-right
+         3. BR  = bottom-right
+         4. BL  = bottom-left
+
+  The prompt at the top tells you which corner is next.
+  Each click shows a small green dot with its label, joined by green lines.
+  After the 4th click the window closes automatically.
+
+  KEYS
+      r  = reset, clear all points and start over
+      q  = quit the program
+
+  TIPS
+    - Click the corners of the BED SURFACE (the mattress area the patient
+      can move across). Not the bed frame, not the floor.
+    - ORDER MATTERS MORE THAN PRECISION. Clicking anti-clockwise or
+      starting at the wrong corner mirrors/rotates the view, which SWAPS
+      LEFT AND RIGHT - so DANGER_LEFT fires when the patient rolls right
+      and the servos push the wrong way.
+    - The feed stays live while you click, so you can adjust the camera
+      and see the result before committing.
+    - Press r to redo. You can also press r later while monitoring.
+
+  DOING IT FROM YOUR PHONE
+    Open  http://192.168.137.1:5000/live  on any device on the hotspot.
+    The corner picker is mirrored there live, so you can stand at the bed
+    and watch what the camera sees while someone clicks on the PC.
+    (The clicking itself must be done in the PC window.)
+
+
+===============================================================================
+  STEP 6 - MONITORING IS RUNNING
+===============================================================================
+
+  After the 4th click:
+
+      Surface defined!  Monitoring started.
+      Keys: [r] reselect corners  |  [t] reset tracker  |  [q] quit
+
+  TWO WINDOWS APPEAR
+
+  "Bed Monitor"  - bed outline, coloured zones, tracking box on the
+                   object, movement trail, status banner.
+
+  "Controls"     - three sliders:
+
+       LEFT  margin   default 150   left danger boundary  (0-640)
+       RIGHT margin   default 490   right danger boundary (0-640)
+       CONF  %        default 12    detection confidence threshold
+
+  Adjust LEFT/RIGHT so the green safe zone covers where the patient
+  normally lies, with red danger zones at the edges.
+  These also feed the classifier - it uses the gap to each boundary as an
+  input feature, so setting them sensibly improves its decisions.
+
+  If the object is NOT being detected, lower CONF % (try 8-10).
+  If random things get detected, raise it (try 20-25).
+
+  LIVE KEYS (click the Bed Monitor window first)
+       r  = re-pick the corners (camera moved)
+       t  = reset the tracker (locked onto the wrong object)
+       q  = quit cleanly
+
+
+===============================================================================
+  STEP 7 - CHECK THE RESULT
+===============================================================================
+
+  MAIN LINK - live video + current zone:
+
+      http://192.168.137.1:5000/live
+
+  The exact JSON the motor ESP32 reads every 2 seconds:
+
+      http://192.168.137.1:5000/status
+
+  From the PC itself you can also use 127.0.0.1 instead of 192.168.137.1
+
+  ALL LINKS
+      :5000/live        live video + zone      <-- use this one
+      :5000/status      exact JSON the ESP32 reads
+      :5000/            dashboard: big zone + full JSON
+      :5000/video       raw MJPEG stream only
+      :5000/frame.jpg   single latest frame
+      :5000/health      server alive check
+      :8081/            federated learning rounds (only if fl_server.py runs)
+
+  Check from the command line:
+
+      curl http://127.0.0.1:5000/status
+
+  A healthy reply looks like:
+
+      {"status":"SAFE","confidence":0.42,"cx":320,"cy":330,
+       "tracking":true,"stream_ok":true,"frame":210,
+       "age_s":0.4,"stale":false}
+
+  READING IT
+      "stale":false   = pipeline is alive and publishing   (GOOD)
+      "stale":true    = img_process.py stopped -> servos park at start
+      "tracking":true = YOLO currently sees the object
+      "cx"/"cy"       = LAST KNOWN position. When tracking is false these
+                        are stale by design, not a live reading.
+
+  MOTOR ESP32 SERIAL should now show real zones instead of STALE:
+
+      Zone changed: STALE -> SAFE
+      Zone: SAFE
+
+  Move the object toward the bed edge. Within ~2 seconds:
+
+      Zone changed: SAFE -> DANGER_RIGHT
+      [ACTION] DANGER - full sweep
+
+  WHAT EACH ZONE DOES TO THE SERVOS
+      SAFE                        hold at start positions
+      WARNING                     gentle nudge (~30% travel)
+      DANGER_LEFT / DANGER_RIGHT  full sweep
+      NOT_FOUND / EMPTY / STALE   hold at start positions
+
+
+===============================================================================
+  STEP 8 - FEDERATED LEARNING  (OPTIONAL - run after collecting data)
+===============================================================================
+
+  This is NOT part of the live loop. Run it after the monitor has been
+  going long enough to log some positions (needs at least 50 rows).
+
+  TERMINAL 3 - the aggregation server:
+
+      cd C:\Projects\sleeping-monitor
+      python fl_server.py
+
+  It listens on port 8081 and waits for 2 clients by default.
+  On a single machine, make it aggregate after just one upload:
+
+      set FL_MIN_CLIENTS=1
+      python fl_server.py
+
+  TERMINAL 4 - the client (one per bed):
+
+      cd C:\Projects\sleeping-monitor
+      python fl_client.py
+
+  What it does:
+      1. Trains a risk classifier on THIS bed's position_log.csv
+      2. Uploads ONLY the model - never the log, never any footage
+      3. Downloads the merged global model
+      4. Installs it as the live brain
+         (old one is backed up to risk_classifier.pkl.bak)
+
+  Other client options:
+
+      python fl_client.py --loop 600      repeat every 10 minutes
+      python fl_client.py --pull-only     only download the global model
+      python fl_client.py --server http://192.168.137.1:8081
+
+  >> Restart img_process.py afterwards to load the new brain. <<
+
+  Watch progress at:   http://192.168.137.1:8081/
+
+
+===============================================================================
+  QUICK REFERENCE - THE WHOLE BASIC RUN
+===============================================================================
+
+  Turn on the "Hariprasath LAPTOP" hotspot
+  Power the ESP32-CAM      (note its IP from Serial Monitor)
+  Power the motor ESP32
+  Close any browser tab showing  :81/stream
+
+  Terminal 1:   cd C:\Projects\sleeping-monitor
+                python app.py
+
+  Terminal 2:   cd C:\Projects\sleeping-monitor
+                python img_process.py
+
+  Then:         click 4 corners  TL -> TR -> BR -> BL
+                adjust the LEFT/RIGHT sliders
+                open http://192.168.137.1:5000/live
+
+  To stop:      press q in the Bed Monitor window
+                press Ctrl+C in each terminal
+
+
+===============================================================================
+  TROUBLESHOOTING
+===============================================================================
+
+  "Zone: STALE" forever on the motor ESP32
+      - Is img_process.py running and past the corner selection?
+      - Is SERVER_IP correct? Run ipconfig and compare.
+      - Windows Firewall blocking port 5000? Allow Python on Private.
+
+  Motor ESP32 shows "[HTTP] Error code: -1"
+      - Cannot reach the server at all. Wrong SERVER_IP, or app.py is
+        not running, or hotspot is off.
+
+  img_process.py hangs on "Opening ESP32-CAM stream"
+      - Should now give up after ~3 seconds and fall back to /capture.
+      - If it hangs longer, a browser tab is holding the :81 stream.
+        Close it.
+
+  Camera stops responding to ping entirely
+      - The ESP32-CAM browned out. Power-cycle it.
+      - Use a solid 5V supply - it draws heavy current while streaming.
+
+  "SEARCHING (lost NN fr)" while the object is clearly visible
+      - Lower the CONF % slider to 8-10.
+      - Press t to reset the tracker.
+      - This was largely fixed already: frames where YOLO detected the
+        object but the tracker had not yet assigned an ID were being
+        thrown away, and the object is now re-acquired by position when
+        its track ID changes.
+      - For fundamentally better detection, raise the camera resolution:
+        in live_monitor.ino line 93, FRAMESIZE_QVGA -> FRAMESIZE_VGA
+        (more pixels on the object, lower frame rate).
+
+  ArduinoJson.h: No such file or directory
+      - Should not happen any more; the sketch no longer uses it.
+        Make sure you re-uploaded the current motor_testing.ino.
+
+  CUDA out of memory
+      - Two Python scripts are both using the GPU. Only run one
+        img_process.py at a time.
+
+  Nothing appears at :5000/live
+      - app.py must be started BEFORE img_process.py.
+      - Nothing is published until you finish clicking the 4 corners.
+
+===============================================================================
