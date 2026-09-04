@@ -49,9 +49,43 @@
     servos to match.
 
 
+  CHOOSING THE CAMERA
+
+    img_process.py ASKS at startup which camera to use, and shows which
+    ones actually responded:
+
+        ============================================================
+         SELECT CAMERA
+        ------------------------------------------------------------
+         1) Phone - IP Webcam   10.184.140.140:8080   [ONLINE ]
+              1920x1080, ~30 fps, lowest latency
+         2) ESP32-CAM           192.168.137.66   [ONLINE ]
+              160x120, ~12 fps
+        ============================================================
+        Choice [1/2] (Enter = 1):
+
+    Press Enter to take the default (whichever is online, phone first).
+
+    To skip the prompt entirely:
+
+        set CAM_SOURCE=phone     always the phone
+        set CAM_SOURCE=esp32     always the ESP32-CAM
+        set CAM_SOURCE=auto      no prompt; phone if present, else ESP32-CAM
+
+    PHONE (lowest latency, best resolution):
+      1. Install "IP Webcam" from the Play Store.
+      2. Open it, scroll down, tap "Start server".
+      3. It shows an address like  http://10.184.140.140:8080
+      4. Put that host/port in img_process.py (PHONE_IP / PHONE_PORT),
+         or per run:   set PHONE_IP=10.184.140.140
+      5. The phone and the PC must be on the SAME network.
+
+    ESP32-CAM: nothing extra - just power it on.
+
+
   THE 3 VALUES THAT MUST BE RIGHT
 
-    img_process.py       CAM_IP     = "192.168.137.99"   <- the camera
+    img_process.py       CAM_IP     = "192.168.137.66"   <- the camera
     motor_testing.ino    SERVER_IP  = "192.168.137.1"    <- your PC
     both .ino files      WIFI_SSID  = "Hariprasath LAPTOP"
 
@@ -90,7 +124,7 @@
 
   Expected values right now:
 
-      img_process.py      CAM_IP     = "192.168.137.99"
+      img_process.py      CAM_IP     = "192.168.137.66"
       motor_testing.ino   SERVER_IP  = "192.168.137.1"
       both .ino files     WIFI_SSID  = "Hariprasath LAPTOP"
 
@@ -169,7 +203,7 @@
      that is OK - the pipeline automatically falls back to single-frame
      capture on port 80. It will just run at a lower frame rate.
 
-  8. If the IP is NOT 192.168.137.99, update it:
+  8. If the IP is NOT 192.168.137.66, update it:
 
          notepad img_process.py
          (line 16)  CAM_IP = os.environ.get("CAM_IP", "192.168.137.XX")
@@ -269,13 +303,13 @@
       Loading Visual Tracker: yolov8s.pt
       Loading Risk Classifier (The Brain): risk_classifier.pkl
       Classes: ['DRIFT WARNING', 'FALL IMMINENT', 'STABLE']
-      Opening ESP32-CAM stream: http://192.168.137.99:81/stream
+      Opening ESP32-CAM stream: http://192.168.137.66:81/stream
       ESP32-CAM stream is live.
 
   If port 81 is not working you will see this instead, which is FINE:
 
-      No MJPEG server on 192.168.137.99:81 - skipping it.
-      Trying single-frame capture: http://192.168.137.99/capture
+      No MJPEG server on 192.168.137.66:81 - skipping it.
+      Trying single-frame capture: http://192.168.137.66/capture
       ESP32-CAM /capture is live - polling single frames.
 
   To force the capture fallback on purpose:

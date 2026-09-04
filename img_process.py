@@ -1,33 +1,77 @@
+import os as _os
+# libjpeg prints "Corrupt JPEG data: premature end of data segment" straight to
+# stderr whenever a streamed frame arrives truncated. That is expected on a live
+# MJPEG feed and the frame is simply skipped, so keep it out of the log.
+_os.environ.setdefault("OPENCV_LOG_LEVEL", "SILENT")
+
 import cv2
 import numpy as np
 import time
 import csv
 import json
 import os
+import socket
+import sys
+import threading
 from collections import deque
 from datetime import datetime
 
 # ─────────────────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────────────────
+# ═════════════════════════════════════════════════════════
+#  CAMERA SOURCE — pick one
+# ═════════════════════════════════════════════════════════
+# "ask"    : (default) prompt in the terminal, showing which cameras respond
+# "phone"  : the IP Webcam Android app (much lower latency, better resolution)
+# "esp32"  : the ESP32-CAM running esp/live_monitor/live_monitor.ino
+# "auto"   : no prompt — phone if it answers, else the ESP32-CAM
+#
+# Override per run without editing this file:
+#     set CAM_SOURCE=phone
+#
+# Currently pinned to the phone: it goes straight to IP Webcam with no probing
+# and no prompt. To bring the camera picker back, swap the two lines below.
+CAM_SOURCE = os.environ.get("CAM_SOURCE", "phone").strip().lower()
+# CAM_SOURCE = os.environ.get("CAM_SOURCE", "ask").strip().lower()
+
+# Without a real terminal (piped output, a service) there is nobody to answer
+# the prompt, so fall back to automatic selection instead of hanging on input.
+if CAM_SOURCE == "ask" and not sys.stdin.isatty():
+    CAM_SOURCE = "auto"
+
 # ── ESP32-CAM live stream (esp/live_monitor/live_monitor.ino) ──
 # Set CAM_IP to the address the ESP32-CAM prints on its serial monitor.
-# Override without editing this file:  set CAM_IP=192.168.1.50
-CAM_IP     = os.environ.get("CAM_IP", "192.168.137.99")
-CAM_PORT   = int(os.environ.get("CAM_PORT", "81"))
-STREAM_URL = os.environ.get("STREAM_URL", f"http://{CAM_IP}:{CAM_PORT}/stream")
+ESP_IP        = os.environ.get("CAM_IP", "192.168.137.66")
+ESP_PORT      = int(os.environ.get("CAM_PORT", "81"))
+ESP_STREAM    = os.environ.get("STREAM_URL", f"http://{ESP_IP}:{ESP_PORT}/stream")
+# Single-JPEG endpoint on the ESP32-CAM's control server (port 80). Used when
+# the MJPEG stream on :81 will not open — that server is the fragile half.
+ESP_CAPTURE   = os.environ.get("CAPTURE_URL", f"http://{ESP_IP}/capture")
 
-# Single-JPEG endpoint on the control server (port 80). Used automatically when
-# the MJPEG stream on :81 will not open — the ESP32-CAM's stream server is the
-# fragile half, while /capture keeps working.
-CAPTURE_URL = os.environ.get("CAPTURE_URL", f"http://{CAM_IP}/capture")
+# ── Phone camera: the "IP Webcam" app (Android) ──
+# Start the app, tap "Start server", and it shows an address like
+# http://10.184.140.140:8080 — put that host and port here.
+#   /video  = MJPEG stream        /shot.jpg = single frame
+PHONE_IP      = os.environ.get("PHONE_IP", "172.23.226.131")
+PHONE_PORT    = int(os.environ.get("PHONE_PORT", "8080"))
+PHONE_STREAM  = os.environ.get("PHONE_STREAM", f"http://{PHONE_IP}:{PHONE_PORT}/video")
+PHONE_CAPTURE = os.environ.get("PHONE_CAPTURE", f"http://{PHONE_IP}:{PHONE_PORT}/shot.jpg")
+
+# Resolved below by pick_camera(); the rest of the pipeline uses these.
+CAM_IP      = ESP_IP
+CAM_PORT    = ESP_PORT
+STREAM_URL  = ESP_STREAM
+CAPTURE_URL = ESP_CAPTURE
 
 # Seconds to wait for the MJPEG stream before giving up on it.
 STREAM_OPEN_TIMEOUT = float(os.environ.get("STREAM_OPEN_TIMEOUT", "12"))
 
 # Fall back to a locally attached webcam when the ESP32-CAM is unreachable.
-# Set to None to disable the fallback and fail loudly instead.
-FALLBACK_SOURCE = 0
+# Default None: this is a bed monitor, so silently switching to the laptop
+# webcam would show the wrong scene while still reporting zones to the ESP32.
+# Better to keep retrying the real camera. Set to 0 only for offline testing.
+FALLBACK_SOURCE = None if os.environ.get("NO_WEBCAM_FALLBACK", "1") == "1" else 0
 
 # ── Local status server (app.py) ──
 # img_process.py writes the zone here; app.py serves it to the motor ESP32.
@@ -46,6 +90,29 @@ LIVE_QUALITY = 70       # JPEG quality for the web view
 # Where app.py is listening; frames are POSTed here for /video.
 LIVE_POST_URL = os.environ.get("LIVE_POST_URL", "http://127.0.0.1:5000/frame")
 
+# How often to rebuild the capture connection while frames are not arriving.
+REOPEN_EVERY_S = 15.0
+
+# ── Capture-path latency tuning ──
+# The ESP32-CAM answers /capture in 0.02-2.7 s depending on the link. Several
+# overlapping workers keep a fresh frame in hand so the monitor loop never
+# waits on a slow individual request.
+CAPTURE_WORKERS   = int(os.environ.get("CAPTURE_WORKERS", "4"))
+# Cap a single request below the 2 s budget: a request already slower than
+# this will never yield a "live" frame, so abandon it and start a fresh one
+# rather than letting every worker pile up behind one stalled connection.
+CAPTURE_TIMEOUT   = float(os.environ.get("CAPTURE_TIMEOUT", "6.0"))
+# Frames older than this are considered stale (the 2 s end-to-end budget).
+CAPTURE_MAX_AGE   = float(os.environ.get("CAPTURE_MAX_AGE", "2.0"))
+# How long read() waits for a fresh frame before handing back what it has.
+CAPTURE_READ_WAIT = float(os.environ.get("CAPTURE_READ_WAIT", "1.5"))
+# Skip the MJPEG stream and go straight to threaded /capture polling.
+PREFER_CAPTURE    = os.environ.get("PREFER_CAPTURE", "0") == "1"
+# A struggling camera can take several seconds to answer, so probe patiently
+# and retry before writing the stream off.
+PROBE_TIMEOUT     = float(os.environ.get("PROBE_TIMEOUT", "6.0"))
+PROBE_ATTEMPTS    = int(os.environ.get("PROBE_ATTEMPTS", "3"))
+
 WARP_SIZE      = 640    # internal bird's-eye canvas — also optimal YOLO input size
 TRAIL_LEN      = 80     # centroid history for the trail
 LOG_EVERY_N    = 5      # CSV rows written every N frames
@@ -57,6 +124,16 @@ NOT_FOUND_TIMEOUT = 30  # frames lost before declaring NOT FOUND
 
 # Zone smoothing — only commit to a new zone if it appears in majority of last N frames
 ZONE_SMOOTH_N  = 8      # rolling window size
+
+# Fraction of the body that must be past a boundary to count as a WARNING.
+# A patient lying across the bed has a wide box that clips the danger strip
+# while their centre of mass is safe, so a small overlap is not a warning.
+WARN_OVERLAP_FRAC = 0.15
+
+# ...and this much of the body over the line is a fall already in progress,
+# even if the centroid has not crossed yet (a wide box keeps the centroid
+# inside long after the patient is really going over).
+DANGER_OVERLAP_FRAC = 0.38
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -75,6 +152,16 @@ YOLO_IOU       = 0.45
 # this many warp-space pixels of the last known centroid is treated as the same
 # object, whatever YOLO decided to call it this frame.
 REACQUIRE_RADIUS = 140
+
+# Reject detections that are really the background. Pointed at a bed (or a
+# board on a table) YOLO confidently labels the whole surface as one big
+# object — a 47%-of-frame "refrigerator" at 0.91 beats the actual object
+# every frame, so the tracker locks onto the furniture and never lets go.
+# Anything covering more than this fraction of the warped view is scenery.
+MAX_DET_AREA_FRAC = 0.25
+
+# ...and anything smaller than this is noise.
+MIN_DET_AREA_FRAC = 0.0002
 
 # 2. The brain: the trained RandomForest risk classifier
 #    (backend/models/risk_classifier.pkl, 86.71% test accuracy).
@@ -159,7 +246,9 @@ def display_scale(src_w, src_h):
     """
     fit = min((SCREEN_W * DISPLAY_FILL) / max(1, src_w),
               (SCREEN_H * DISPLAY_FILL) / max(1, src_h))
-    return max(1.0, min(fit, 4.0))
+    # Cap at 8x: at QQVGA (160x120) a 4x limit left the window at only
+    # 640x480, which is hard to click corners on.
+    return max(1.0, min(fit, 8.0))
 
 
 # ─────────────────────────────────────────────────────────
@@ -535,81 +624,357 @@ def classify_state(cx_w, cy_w, bw, bh, vx, vy, ax, lz, rz):
     return zone, conf
 
 # ── Camera — ESP32-CAM ──
-class CapturePoller:
-    """Reads single JPEGs from /capture, quacking like cv2.VideoCapture.
+class MjpegReader:
+    """Reads the ESP32-CAM MJPEG stream directly, bypassing FFmpeg.
 
-    The ESP32-CAM's MJPEG server on :81 is the part that tends to fall over;
-    /capture on :80 stays up. Polling it is slower but keeps the monitor
-    running on exactly the same code path.
+    OpenCV hands the URL to FFmpeg, which handles this camera's chunked
+    multipart response badly: the socket delivers ~12 fps while
+    cv2.VideoCapture manages 0.4. Parsing the JPEG frames ourselves off a
+    plain socket keeps the full frame rate, and a background thread means
+    read() always returns the newest frame without blocking.
     """
 
     def __init__(self, url):
-        self.url = url
-        self._session = None
-        try:
-            import requests
-            self._session = requests.Session()
-        except ImportError:
-            pass
+        from urllib.parse import urlparse
+        u = urlparse(url)
+        self.host = u.hostname
+        self.port = u.port or 80
+        self.path = u.path or "/stream"
+
+        self._latest = None
+        self._stamp = 0.0
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._pump, daemon=True)
+        self._thread.start()
+
+        deadline = time.time() + STREAM_OPEN_TIMEOUT
+        while time.time() < deadline:
+            with self._lock:
+                if self._latest is not None:
+                    return
+            time.sleep(0.05)
+
+    def _pump(self):
+        SOI = b"\xff\xd8"          # JPEG start of image
+        EOI = b"\xff\xd9"          # JPEG end of image
+        while not self._stop.is_set():
+            sk = None
+            try:
+                sk = socket.create_connection((self.host, self.port), timeout=4)
+                # Short read timeout: a healthy stream delivers ~12 fps, so
+                # 2 s of silence means it has stalled. Reconnecting quickly
+                # beats waiting on a dead socket.
+                sk.settimeout(2.0)
+                sk.sendall(("GET %s HTTP/1.1\r\nHost: %s\r\n"
+                            "Connection: keep-alive\r\n\r\n"
+                            % (self.path, self.host)).encode())
+                buf = b""
+                while not self._stop.is_set():
+                    chunk = sk.recv(65536)
+                    if not chunk:
+                        break
+                    buf += chunk
+
+                    # Pull out every complete JPEG the buffer now holds.
+                    while True:
+                        i = buf.find(SOI)
+                        if i < 0:
+                            break
+                        j = buf.find(EOI, i + 2)
+                        if j < 0:
+                            break
+                        jpg = buf[i:j + 2]
+                        buf = buf[j + 2:]
+                        # A truncated frame decodes to None (or prints
+                        # "Corrupt JPEG data"); either way just skip it — the
+                        # next frame is milliseconds away.
+                        frame = cv2.imdecode(np.frombuffer(jpg, np.uint8),
+                                             cv2.IMREAD_COLOR)
+                        if frame is not None:
+                            with self._lock:
+                                self._latest = frame
+                                self._stamp = time.time()
+
+                    # Never let a desynced buffer grow without bound.
+                    if len(buf) > 1_000_000:
+                        buf = buf[-100_000:]
+            except OSError:
+                pass
+            finally:
+                if sk is not None:
+                    try:
+                        sk.close()
+                    except OSError:
+                        pass
+            if not self._stop.is_set():
+                time.sleep(0.1)     # reconnect promptly
 
     def read(self):
-        try:
-            if self._session is not None:
-                r = self._session.get(self.url, timeout=5)
-                if r.status_code != 200:
-                    return False, None
-                buf = np.frombuffer(r.content, dtype=np.uint8)
-            else:
-                from urllib.request import urlopen
-                with urlopen(self.url, timeout=5) as resp:
-                    buf = np.frombuffer(resp.read(), dtype=np.uint8)
-            frame = cv2.imdecode(buf, cv2.IMREAD_COLOR)
-            return frame is not None, frame
-        except Exception:
-            return False, None
+        """Newest decoded frame, without waiting.
+
+        Blocking here to wait for a "fresher" frame adds latency rather than
+        removing it: the pump thread is already storing frames the instant
+        they arrive, so whatever is in hand IS the newest. Only wait when
+        nothing has arrived at all yet.
+        """
+        with self._lock:
+            if self._latest is not None:
+                return True, self._latest
+
+        deadline = time.time() + CAPTURE_READ_WAIT
+        while time.time() < deadline:
+            time.sleep(0.005)
+            with self._lock:
+                if self._latest is not None:
+                    return True, self._latest
+        return False, None
 
     def set(self, *_a, **_k):
         return False
 
     def release(self):
-        if self._session is not None:
-            self._session.close()
+        self._stop.set()
 
 
-def _mjpeg_responds(host, port, path="/stream", timeout=3.0):
+class CapturePoller:
+    """Reads single JPEGs from /capture, quacking like cv2.VideoCapture.
+
+    The ESP32-CAM's MJPEG server on :81 is the fragile half; /capture on :80
+    stays up. Fetching happens on background threads that keep the newest
+    frame in hand, so a slow request never stalls the monitor loop: an
+    individual grab can take 2 s on a bad link, but read() returns the most
+    recent frame immediately.
+    """
+
+    def __init__(self, url, workers=CAPTURE_WORKERS):
+        self.url = url
+        self._latest = None          # newest decoded frame
+        self._stamp = 0.0            # when it arrived
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._threads = []
+
+        try:
+            import requests
+            self._requests = requests
+        except ImportError:
+            self._requests = None
+
+        # Several workers overlap their requests, so one slow response does
+        # not gate the next: whichever returns first refreshes the frame.
+        for _ in range(max(1, workers)):
+            t = threading.Thread(target=self._pump, daemon=True)
+            t.start()
+            self._threads.append(t)
+
+        # Give the first fetch a moment to land.
+        deadline = time.time() + 8.0
+        while time.time() < deadline:
+            with self._lock:
+                if self._latest is not None:
+                    break
+            time.sleep(0.05)
+
+    def _fetch(self):
+        if self._requests is not None:
+            sess = self._requests.Session()
+            while not self._stop.is_set():
+                try:
+                    r = sess.get(self.url, timeout=CAPTURE_TIMEOUT)
+                    if r.status_code == 200 and r.content:
+                        return r.content
+                except Exception:
+                    pass
+                if self._stop.wait(0.05):
+                    return None
+            return None
+        from urllib.request import urlopen
+        try:
+            with urlopen(self.url, timeout=CAPTURE_TIMEOUT) as resp:
+                return resp.read()
+        except Exception:
+            return None
+
+    def _pump(self):
+        while not self._stop.is_set():
+            data = self._fetch()
+            if not data:
+                continue
+            try:
+                frame = cv2.imdecode(np.frombuffer(data, np.uint8),
+                                     cv2.IMREAD_COLOR)
+            except Exception:
+                continue
+            if frame is None:
+                continue
+            with self._lock:
+                self._latest = frame
+                self._stamp = time.time()
+
+    def read(self):
+        """Newest frame, without waiting. See MjpegReader.read()."""
+        with self._lock:
+            if self._latest is not None:
+                return True, self._latest
+
+        deadline = time.time() + CAPTURE_READ_WAIT
+        while time.time() < deadline:
+            time.sleep(0.005)
+            with self._lock:
+                if self._latest is not None:
+                    return True, self._latest
+        return False, None
+
+    def set(self, *_a, **_k):
+        return False
+
+    def release(self):
+        self._stop.set()
+
+
+def _mjpeg_responds(host, port, path="/stream", timeout=PROBE_TIMEOUT):
     """True if the stream port actually returns HTTP headers.
 
-    Worth doing before cv2.VideoCapture: FFmpeg enforces its own ~30 s timeout
-    and ignores ours, so probing first turns a 30 s stall into a 3 s check.
+    Worth doing before opening the stream: it turns a long stall on a dead
+    port into a quick check. A struggling camera often misses the first
+    attempt and answers the second, so retry before writing it off.
     """
-    import socket
-    try:
-        with socket.create_connection((host, port), timeout=timeout) as sk:
-            sk.settimeout(timeout)
-            sk.sendall(f"GET {path} HTTP/1.1\r\nHost: {host}\r\n\r\n".encode())
-            head = sk.recv(64)
-            return head.startswith(b"HTTP/")
-    except OSError:
-        return False
+    for attempt in range(PROBE_ATTEMPTS):
+        try:
+            with socket.create_connection((host, port), timeout=timeout) as sk:
+                sk.settimeout(timeout)
+                sk.sendall(("GET %s HTTP/1.1\r\nHost: %s\r\n\r\n"
+                            % (path, host)).encode())
+                if sk.recv(64).startswith(b"HTTP/"):
+                    return True
+        except OSError:
+            pass
+        if attempt + 1 < PROBE_ATTEMPTS:
+            time.sleep(0.5)
+    return False
+
+
+def _stream_path():
+    """URL path of the selected camera's MJPEG stream."""
+    from urllib.parse import urlparse
+    return urlparse(STREAM_URL).path or "/stream"
+
+
+def pick_camera():
+    """Decide which camera to use and point the globals at it.
+
+    Returns a short label for logging. "auto" prefers the phone because IP
+    Webcam gives far lower latency and a much larger frame than the
+    ESP32-CAM's QQVGA, but the ESP32-CAM stays fully supported.
+    """
+    global CAM_IP, CAM_PORT, STREAM_URL, CAPTURE_URL
+
+    def use_phone():
+        global CAM_IP, CAM_PORT, STREAM_URL, CAPTURE_URL
+        CAM_IP, CAM_PORT = PHONE_IP, PHONE_PORT
+        STREAM_URL, CAPTURE_URL = PHONE_STREAM, PHONE_CAPTURE
+
+    def use_esp():
+        global CAM_IP, CAM_PORT, STREAM_URL, CAPTURE_URL
+        CAM_IP, CAM_PORT = ESP_IP, ESP_PORT
+        STREAM_URL, CAPTURE_URL = ESP_STREAM, ESP_CAPTURE
+
+    if CAM_SOURCE == "phone":
+        use_phone()
+        print(f"  Camera source: PHONE (IP Webcam) at {PHONE_IP}:{PHONE_PORT}")
+        return "phone"
+
+    if CAM_SOURCE == "esp32":
+        use_esp()
+        print(f"  Camera source: ESP32-CAM at {ESP_IP}")
+        return "esp32"
+
+    # "ask" (the default): probe both, then let the operator choose. Showing
+    # which cameras actually responded avoids picking one that is not on.
+    if CAM_SOURCE == "ask":
+        print()
+        print("  Checking which cameras are available...")
+        phone_up = _mjpeg_responds(PHONE_IP, PHONE_PORT, "/video")
+        esp_up   = _mjpeg_responds(ESP_IP, ESP_PORT, "/stream")
+
+        p_mark = "ONLINE " if phone_up else "offline"
+        e_mark = "ONLINE " if esp_up else "offline"
+        # Plain ASCII: the Windows console is cp1252 and box-drawing
+        # characters raise UnicodeEncodeError there.
+        print()
+        print("  " + "=" * 60)
+        print("   SELECT CAMERA")
+        print("  " + "-" * 60)
+        print("   1) Phone - IP Webcam   %s:%d   [%s]"
+              % (PHONE_IP, PHONE_PORT, p_mark))
+        print("        1920x1080, ~30 fps, lowest latency")
+        print("   2) ESP32-CAM           %s   [%s]" % (ESP_IP, e_mark))
+        print("        160x120, ~12 fps")
+        print("  " + "=" * 60)
+
+        # Default to whichever is up (phone first) so Enter does the sane thing.
+        default = "1" if phone_up else ("2" if esp_up else "1")
+        while True:
+            try:
+                choice = input(f"  Choice [1/2] (Enter = {default}): ").strip()
+            except (EOFError, KeyboardInterrupt):
+                choice = ""
+            choice = choice or default
+            if choice in ("1", "2"):
+                break
+            print("  Please type 1 or 2.")
+
+        if choice == "1":
+            use_phone()
+            if not phone_up:
+                print(f"  NOTE: phone did not answer — is IP Webcam started?")
+            print(f"  Camera source: PHONE (IP Webcam) at {PHONE_IP}:{PHONE_PORT}")
+            return "phone"
+
+        use_esp()
+        if not esp_up:
+            print("  NOTE: ESP32-CAM stream did not answer; will try /capture.")
+        print(f"  Camera source: ESP32-CAM at {ESP_IP}")
+        return "esp32"
+
+    # auto: whichever answers, phone first. No prompt.
+    if _mjpeg_responds(PHONE_IP, PHONE_PORT, "/video"):
+        use_phone()
+        print(f"  Camera source: PHONE (IP Webcam) at {PHONE_IP}:{PHONE_PORT}")
+        return "phone"
+
+    use_esp()
+    print(f"  Phone camera not answering at {PHONE_IP}:{PHONE_PORT}")
+    print(f"  Camera source: ESP32-CAM at {ESP_IP}")
+    return "esp32"
 
 
 def open_stream():
-    """Open the ESP32-CAM: MJPEG first, then /capture, then a local webcam."""
-    if _mjpeg_responds(CAM_IP, CAM_PORT):
-        print(f"  Opening ESP32-CAM stream: {STREAM_URL}")
-        c = cv2.VideoCapture(STREAM_URL)
-        try:
-            c.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        except Exception:
-            pass
+    """Open the selected camera: MJPEG first, then single-frame polling."""
+    pick_camera()
 
-        t0 = time.time()
-        while time.time() - t0 < STREAM_OPEN_TIMEOUT:
+    # PREFER_CAPTURE skips the MJPEG attempt entirely. Worth setting when the
+    # camera's stream server is unreliable: the threaded poller gives steadier
+    # latency than a stream that keeps collapsing and reconnecting.
+    if PREFER_CAPTURE:
+        print(f"  PREFER_CAPTURE set — using {CAPTURE_URL}")
+    elif _mjpeg_responds(CAM_IP, CAM_PORT, _stream_path()):
+        print(f"  Opening stream: {STREAM_URL}")
+        # Direct MJPEG parsing, not cv2.VideoCapture: FFmpeg only manages
+        # ~0.4 fps on this camera's chunked response, against ~12 fps read
+        # straight off the socket.
+        c = MjpegReader(STREAM_URL)
+        # The constructor waits for the first frame, but give read() a couple
+        # of tries: the very first decode can land just after that window.
+        ok, frm = False, None
+        for _ in range(3):
             ok, frm = c.read()
             if ok and frm is not None:
-                print("  ESP32-CAM stream is live.")
-                return c, frm, True
-            time.sleep(0.2)
+                break
+        if ok and frm is not None:
+            print("  Stream is live.")
+            return c, frm, True
 
         c.release()
         print("  MJPEG stream opened but sent no frames.")
@@ -623,14 +988,14 @@ def open_stream():
     while time.time() - t0 < 10.0:
         ok, frm = poller.read()
         if ok:
-            print("  ESP32-CAM /capture is live — polling single frames.")
+            print("  Single-frame polling is live.")
             print("  (Lower frame rate than MJPEG, but the pipeline is identical.)")
             return poller, frm, True
         time.sleep(0.3)
     poller.release()
 
     if FALLBACK_SOURCE is None:
-        raise SystemExit(f"  Could not reach the ESP32-CAM at {CAM_IP}.")
+        raise SystemExit(f"  Could not reach the camera at {CAM_IP}:{CAM_PORT}.")
 
     print(f"  ESP32-CAM unreachable — falling back to local camera {FALLBACK_SOURCE}.")
     c = cv2.VideoCapture(FALLBACK_SOURCE)
@@ -683,66 +1048,135 @@ _frame_session = None
 _frame_post_ok = True
 
 
-def publish_frame(img):
-    """Send the annotated frame to app.py for its /video endpoint.
+_frame_q = None
+_frame_worker = None
 
-    Posting into the server's memory rather than swapping a file on disk:
-    Windows timestamps are too coarse to distinguish frames written a few
-    milliseconds apart, so a file-based handoff silently drops most of them.
+
+def _frame_sender():
+    """Background sender for the browser view.
+
+    Encoding and POSTing used to happen inline in the monitor loop, so every
+    published frame cost a JPEG encode plus a blocking HTTP request (up to a
+    second). That delay landed straight on the live view AND on the zone the
+    ESP32 reads. Now the loop just drops the newest frame in a 1-slot queue.
     """
-    global _frame_session, _frame_post_ok
-
+    global _frame_post_ok
+    sess = None
     try:
-        ok, buf = cv2.imencode(".jpg", img,
-                               [int(cv2.IMWRITE_JPEG_QUALITY), LIVE_QUALITY])
-        if not ok:
-            return
-        jpg = buf.tobytes()
-    except cv2.error:
-        return
+        import requests
+        sess = requests.Session()
+    except ImportError:
+        _frame_post_ok = False
 
-    if _frame_post_ok:
-        try:
-            if _frame_session is None:
-                import requests
-                _frame_session = requests.Session()
-            _frame_session.post(LIVE_POST_URL, data=jpg, timeout=1.0,
-                                headers={"Content-Type": "image/jpeg"})
+    while True:
+        img = _frame_q.get()
+        if img is None:
             return
-        except ImportError:
-            _frame_post_ok = False
-        except Exception:
-            # Server not up (yet). Fall through to the file so the view still
-            # works, and keep trying the socket on later frames.
+        try:
+            ok, buf = cv2.imencode(".jpg", img,
+                                   [int(cv2.IMWRITE_JPEG_QUALITY), LIVE_QUALITY])
+            if not ok:
+                continue
+            jpg = buf.tobytes()
+        except cv2.error:
+            continue
+
+        if sess is not None:
+            try:
+                sess.post(LIVE_POST_URL, data=jpg, timeout=2.0,
+                          headers={"Content-Type": "image/jpeg"})
+                continue
+            except Exception:
+                pass   # server down; fall through to the file
+
+        try:
+            tmp = LIVE_FRAME + ".tmp"
+            with open(tmp, "wb") as f:
+                f.write(jpg)
+            for _ in range(3):
+                try:
+                    os.replace(tmp, LIVE_FRAME)
+                    break
+                except PermissionError:
+                    time.sleep(0.005)
+        except OSError:
             pass
 
-    # Fallback: leave the frame on disk for app.py to pick up.
+
+def publish_frame(img):
+    """Hand the newest frame to the background sender. Never blocks."""
+    global _frame_q, _frame_worker
+    if _frame_q is None:
+        import queue
+        _frame_q = queue.Queue(maxsize=1)
+        _frame_worker = threading.Thread(target=_frame_sender, daemon=True)
+        _frame_worker.start()
+
+    # Keep only the newest frame: if the sender is still busy, the older one
+    # is already stale and worth dropping.
     try:
-        tmp = LIVE_FRAME + ".tmp"
-        with open(tmp, "wb") as f:
-            f.write(jpg)
-        for _ in range(3):
-            try:
-                os.replace(tmp, LIVE_FRAME)
-                return
-            except PermissionError:
-                time.sleep(0.005)
-    except OSError:
-        pass
+        _frame_q.put_nowait(img)
+    except Exception:
+        try:
+            _frame_q.get_nowait()
+            _frame_q.put_nowait(img)
+        except Exception:
+            pass
 
 
-def zone_from_geometry(cx_w, lz, rz, tracking):
-    """Derive the zone from the centroid when no classifier is loaded."""
+def zone_from_geometry(cx_w, lz, rz, tracking, bx=None, bw=None):
+    """Derive the zone from how much of the body has crossed a boundary.
+
+    Judged on the SHARE of the body past the line, not on its outermost pixel
+    and not on the centroid alone:
+
+      * A patient lying across the bed has a wide box whose tip clips the
+        danger strip while their mass is safe - that must not raise anything.
+      * A patient who is genuinely half over the edge is falling even though
+        their centroid has not crossed the line yet, because the box is wide.
+    """
     if not tracking or cx_w is None:
         return "EMPTY"
 
-    band = max(20, int((rz - lz) * 0.15))   # WARNING band inside each boundary
+    # Centroid fully across is unambiguous: always DANGER.
     if cx_w < lz:
         return "DANGER_LEFT"
     if cx_w > rz:
         return "DANGER_RIGHT"
-    if cx_w < lz + band or cx_w > rz - band:
+
+    # Without a box the centroid is all we have, and it is inside.
+    if bx is None or bw is None or bw <= 0:
+        return "SAFE"
+
+    left, right = bx, bx + bw
+    over_left  = max(0, lz - left)  / float(bw)
+    over_right = max(0, right - rz) / float(bw)
+
+    # A large share of the body past the line is a fall already happening,
+    # even while the centroid is still (just) inside.
+    if over_left >= DANGER_OVERLAP_FRAC:
+        return "DANGER_LEFT"
+    if over_right >= DANGER_OVERLAP_FRAC:
+        return "DANGER_RIGHT"
+
+    # A smaller share is a lean worth bracing for.
+    if max(over_left, over_right) >= WARN_OVERLAP_FRAC:
         return "WARNING"
+
+    return "SAFE"
+
+    left, right = bx, bx + bw
+
+    # How far past each boundary the body reaches, as a fraction of its width.
+    over_left  = max(0, lz - left)  / float(bw)
+    over_right = max(0, right - rz) / float(bw)
+
+    # A genuine lean puts a real share of the body over the line. A wide box
+    # merely clipping the strip by a few percent is someone lying across the
+    # bed, not someone falling off it.
+    if max(over_left, over_right) >= WARN_OVERLAP_FRAC:
+        return "WARNING"
+
     return "SAFE"
 
 # ── Corner selection ──
@@ -791,6 +1225,8 @@ log_counter  = 0
 status_counter = 0
 live_counter = 0
 read_fail    = 0
+last_fail_report = 0.0
+last_reopen      = time.time()
 
 # Size the monitor window to the screen rather than to the tiny camera frame.
 monitor_scale = display_scale(first_frame.shape[1], first_frame.shape[0])
@@ -815,10 +1251,19 @@ while True:
         # The ESP32-CAM dropped the connection (reboot, WiFi blip). Tell the
         # ESP32 the feed is gone, then try to pick the stream back up.
         read_fail += 1
-        if read_fail == 1 or read_fail % 30 == 0:
-            print(f"  [STREAM] read failed ({read_fail}) — reconnecting…")
+
+        # A single-frame poller fails one read at a time, so the old
+        # "reconnect after 30 consecutive misses" rule never fired for it and
+        # the loop just spun printing the same line. Reconnect on a timer
+        # instead, and only report occasionally.
+        now_fail = time.time()
+        if read_fail == 1 or now_fail - last_fail_report >= 5.0:
+            last_fail_report = now_fail
+            print(f"  [STREAM] no frame ({read_fail} misses) — retrying…")
             publish_status("NOT_FOUND", 0.0, last_cx_w, last_cy_w, False, frame_no)
-        if read_fail >= 30:
+
+        if now_fail - last_reopen >= REOPEN_EVERY_S:
+            last_reopen = now_fail
             read_fail = 0
             # Reopen the same way we opened originally, so a dropped MJPEG
             # stream can come back as /capture polling rather than dying.
@@ -829,19 +1274,27 @@ while True:
             time.sleep(1.0)
             try:
                 cap, _frm, stream_ok = open_stream()
+                last_reopen = time.time()
             except SystemExit:
-                print("  [STREAM] camera still unreachable — retrying…")
+                # No webcam fallback configured, which is what we want: keep
+                # the old handle and try the real camera again next cycle
+                # rather than quietly monitoring the wrong scene.
+                print("  [STREAM] ESP32-CAM unreachable — will keep retrying.")
+                last_reopen = time.time()
         else:
-            time.sleep(0.05)
+            time.sleep(0.3)   # do not hammer a struggling camera
         continue
 
     read_fail = 0
 
-    # Drain buffer for freshest frame (minimize stream latency)
-    for _ in range(2):
-        ret2, f2 = cap.read()
-        if ret2:
-            frame = f2
+    # Only a real cv2.VideoCapture buffers frames and needs draining. The
+    # threaded readers already hand back the newest frame, so re-reading them
+    # twice per iteration just burned time and could block on a slow link.
+    if isinstance(cap, cv2.VideoCapture):
+        for _ in range(2):
+            ret2, f2 = cap.read()
+            if ret2:
+                frame = f2
 
     frame_no += 1
 
@@ -926,11 +1379,19 @@ while True:
             else:
                 ids = np.full(len(xywhs), -1, dtype=int)
 
+            frame_area = float(WARP_SIZE * WARP_SIZE)
             for i in range(len(xywhs)):
                 x1 = int(xywhs[i,0] - xywhs[i,2]/2)
                 y1 = int(xywhs[i,1] - xywhs[i,3]/2)
                 bw = int(xywhs[i,2])
                 bh = int(xywhs[i,3])
+
+                # Drop the scenery. A box covering half the view is the bed,
+                # the tray or the wall — never the patient we are tracking.
+                area_frac = (bw * bh) / frame_area
+                if area_frac > MAX_DET_AREA_FRAC or area_frac < MIN_DET_AREA_FRAC:
+                    continue
+
                 detections.append({
                     "id":    int(ids[i]),
                     "bbox":  (x1, y1, bw, bh),
@@ -963,16 +1424,27 @@ while True:
             lost_frames = 0
 
     if chosen is None and detections:
-        chosen     = max(detections, key=lambda d: d["conf"])
-        locked_id  = chosen["id"]
+        chosen      = max(detections, key=lambda d: d["conf"])
         lost_frames = 0
-        print(f"  Locked onto track ID={locked_id} ({chosen['class']} @ {chosen['conf']:.0%})")
+        # id -1 means the tracker has not confirmed this detection yet. Storing
+        # it as the lock would be meaningless (every unconfirmed box shares it),
+        # so stay unlocked and let position re-acquisition carry identity until
+        # a real ID appears.
+        if chosen["id"] >= 0:
+            locked_id = chosen["id"]
+            print(f"  Locked onto track ID={locked_id} "
+                  f"({chosen['class']} @ {chosen['conf']:.0%})")
+        else:
+            locked_id = None
 
     # ── 2. Classification Brain (or geometric fallback) ──
     geo_zone = zone_from_geometry(
         chosen["cx"] if chosen is not None else last_cx_w,
         LZ, RZ,
         chosen is not None,
+        # Box edges, so a body fully inside the safe zone reads SAFE.
+        bx=chosen["bbox"][0] if chosen is not None else None,
+        bw=chosen["bbox"][2] if chosen is not None else None,
     )
 
     if state_model is not None and chosen is not None:
@@ -988,6 +1460,21 @@ while True:
         # near-edge WARNING that earns a gentle nudge before a full sweep.
         elif raw_zone == "SAFE" and geo_zone == "WARNING":
             raw_zone = "WARNING"
+
+        # GEOMETRY HAS THE FINAL SAY ON DANGER.
+        #
+        # The classifier was trained on a different bed, camera and object, so
+        # it happily calls DANGER while the body is plainly inside the green
+        # zone. Where the object physically is, is not a matter of opinion:
+        # if the whole body is inside the boundaries it is not falling, no
+        # matter how confident the model is.
+        if raw_zone.startswith("DANGER") and geo_zone in ("SAFE", "EMPTY"):
+            raw_zone = geo_zone
+        # ...and a DANGER call must at least agree on which side.
+        elif raw_zone == "DANGER_LEFT" and geo_zone == "DANGER_RIGHT":
+            raw_zone = geo_zone
+        elif raw_zone == "DANGER_RIGHT" and geo_zone == "DANGER_LEFT":
+            raw_zone = geo_zone
     else:
         # No detection this frame (or no model): geometry is all we have.
         raw_zone, state_conf = geo_zone, 0.0

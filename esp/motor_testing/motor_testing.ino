@@ -26,12 +26,47 @@ const unsigned long POLL_INTERVAL_MS = 250;
 // ──────────────────────────────────────────
 // Servo config — UNCHANGED from original
 // ──────────────────────────────────────────
-Servo servo1;
-Servo servo2;
+// ONE MOTOR PER SIDE.
+//   GP19 -> LEFT  edge of the bed
+//   GP18 -> RIGHT edge of the bed
+// Named by side, not by number, so the mapping cannot be misread.
+Servo servoLeft;    // GP19
+Servo servoRight;   // GP18
 
-const int SERVO1_START = 1000;   // GP18 start position
-const int SERVO2_START = 1500;   // GP19 start position
-const int TRAVEL_MAX   = 800;    // µs travel range
+const int PIN_LEFT   = 19;
+const int PIN_RIGHT  = 18;
+
+// Resting (flat) pulse width for each side.
+const int LEFT_START  = 1500;   // GP19 rest
+const int RIGHT_START = 1000;   // GP18 rest
+
+// Lift travel. With attach(500, 2500) the servo spans 180 deg over 2000 us,
+// so roughly 11 us per degree:
+//     1200 us ~= 108 deg  (side panel swung a full 90 deg - too far)
+//      860 us ~=  77 deg  - steep enough to block a fall, backed off from
+//                            fully vertical so the panel does not overshoot.
+const int TRAVEL_MAX   = 860;    // us of travel for a full lift
+
+// WARNING angle. The sides rise this far and STAY there while the patient is
+// near an edge - braced and ready - without attempting to tilt them back.
+// ~620 us is about 56 deg: the angle the sides SIT at while braced. Raised
+// so a braced side genuinely resists a roll rather than just leaning in.
+const int READY_OFFSET = 620;    // us
+
+// Once the patient is back in the safe zone the sides HOLD their current
+// tilt for this long before returning to flat, in case the patient moves
+// straight back towards the edge.
+const int SETTLE_HOLD_MS  = 10000;  // 10 s
+
+// Movement durations (ms). Longer = smoother and gentler.
+const int LIFT_MS  = 1200;  // rest/ready -> full lift: deliberate, not a snap
+const int EASE_MS  = 1400;  // moving to the WARNING hold angle
+const int LOWER_MS = 1800;  // coming back down: slowest, nothing is urgent
+
+// Which way each servo must move from rest in order to LIFT its side.
+// Flip a sign here if a side tilts the wrong way on the real rig.
+const int LEFT_DIR  = -1;   // GP19 lifts by decreasing pulse width
+const int RIGHT_DIR = +1;   // GP18 lifts by increasing pulse width
 
 // ──────────────────────────────────────────
 // State
@@ -52,44 +87,158 @@ bool actedThisCycle = false;
 // Helpers — servo moves
 // ──────────────────────────────────────────
 
-// Return both servos to their individual start positions
+// Both motors back to rest.
 void goToStart() {
-  servo1.writeMicroseconds(SERVO1_START);
-  servo2.writeMicroseconds(SERVO2_START);
+  servoLeft.writeMicroseconds(LEFT_START);
+  servoRight.writeMicroseconds(RIGHT_START);
 }
 
-// Full sweep (same as original loop behaviour) — used on DANGER
-void fullSweep() {
-  // Forward
-  for (int offset = 0; offset <= TRAVEL_MAX; offset += 4) {
-    servo1.writeMicroseconds(SERVO1_START + offset);
-    servo2.writeMicroseconds(SERVO2_START - offset);
-    delay(2);
+// Move one servo smoothly from one offset to another.
+//
+// The servo only refreshes its position every 20 ms (50 Hz), so writing 8 us
+// steps every 2 ms just queued ten values per refresh and the motor lurched
+// through them — that is what made the tilt look stepwise. Instead, drive it
+// on the servo's own 20 ms cadence and ease in/out, so each refresh gets one
+// smoothly interpolated position.
+void moveTo(Servo& sv, int startUs, int dir, int fromOff, int toOff,
+            int durationMs) {
+  if (fromOff == toOff) {
+    sv.writeMicroseconds(startUs + dir * toOff);
+    return;
   }
-  // Reverse — return to start
-  for (int offset = TRAVEL_MAX; offset >= 0; offset -= 4) {
-    servo1.writeMicroseconds(SERVO1_START + offset);
-    servo2.writeMicroseconds(SERVO2_START - offset);
-    delay(2);
+
+  const int FRAME_MS = 20;                       // one servo refresh
+  int steps = durationMs / FRAME_MS;
+  if (steps < 1) steps = 1;
+
+  for (int i = 1; i <= steps; i++) {
+    float t = (float)i / (float)steps;           // 0 -> 1
+    // Ease in/out (smoothstep): starts gently, accelerates, settles gently,
+    // instead of slamming from a standstill to full speed and back.
+    float e = t * t * (3.0f - 2.0f * t);
+    int off = fromOff + (int)((toOff - fromOff) * e);
+    sv.writeMicroseconds(startUs + dir * off);
+    delay(FRAME_MS);
   }
+  sv.writeMicroseconds(startUs + dir * toOff);
 }
 
-// Gentle nudge (~30 % of travel) — used on WARNING
-void gentleNudge() {
-  int nudge = TRAVEL_MAX * 30 / 100;  // 30 % of TRAVEL_MAX
-  // Forward nudge
-  for (int offset = 0; offset <= nudge; offset += 4) {
-    servo1.writeMicroseconds(SERVO1_START + offset);
-    servo2.writeMicroseconds(SERVO2_START - offset);
-    delay(2);
+// How far each side is currently raised (us above its resting position), so
+// moves start from the real position instead of jumping.
+int leftOff  = 0;
+int rightOff = 0;
+
+// millis() when SAFE was first seen; 0 means "not currently safe".
+unsigned long safeSince = 0;
+
+// Re-assert the current position on every pass.
+//
+// Without this the servo is only ever written to while it is MOVING; once it
+// reaches its target nothing refreshes the pulse, and a loaded servo slowly
+// sags back. Re-sending the same value each cycle keeps it actively holding
+// the tilt for as long as the zone stays unsafe.
+void holdPosition() {
+  servoLeft.writeMicroseconds(LEFT_START + LEFT_DIR * leftOff);
+  servoRight.writeMicroseconds(RIGHT_START + RIGHT_DIR * rightOff);
+}
+
+// ── DANGER: lift the side the patient is rolling towards, and HOLD ──
+// Raising is one-way: a side only ever goes UP while the patient is unsafe.
+// Nothing is lowered until the zone reads SAFE, so a patient shifting around
+// near an edge cannot make the servos oscillate.
+void liftLeft() {
+  safeSince = 0;                     // no longer safe; restart the settle timer
+  if (leftOff < TRAVEL_MAX) {
+    moveTo(servoLeft, LEFT_START, LEFT_DIR, leftOff, TRAVEL_MAX, LIFT_MS);
+    leftOff = TRAVEL_MAX;
   }
-  delay(200);
-  // Return to start
-  for (int offset = nudge; offset >= 0; offset -= 4) {
-    servo1.writeMicroseconds(SERVO1_START + offset);
-    servo2.writeMicroseconds(SERVO2_START - offset);
-    delay(2);
+  // The RIGHT side goes FULLY FLAT. WARNING raises both sides, so without
+  // this the opposite edge is still standing at the ready angle and the bed
+  // looks tilted on both sides instead of dipping towards the safe side.
+  if (rightOff != 0) {
+    moveTo(servoRight, RIGHT_START, RIGHT_DIR, rightOff, 0, LOWER_MS);
+    rightOff = 0;
   }
+  holdPosition();
+}
+
+void liftRight() {
+  safeSince = 0;
+  if (rightOff < TRAVEL_MAX) {
+    moveTo(servoRight, RIGHT_START, RIGHT_DIR, rightOff, TRAVEL_MAX, LIFT_MS);
+    rightOff = TRAVEL_MAX;
+  }
+  // LEFT side fully flat, so only the right edge is raised.
+  if (leftOff != 0) {
+    moveTo(servoLeft, LEFT_START, LEFT_DIR, leftOff, 0, LOWER_MS);
+    leftOff = 0;
+  }
+  holdPosition();
+}
+
+// ── WARNING: brace both sides and STAY braced ──
+// The patient is still on the bed, so a full lift would achieve nothing. Both
+// sides rise to READY_OFFSET and hold.
+//
+// Crucially this NEVER lowers a side. The zone flickers between DANGER and
+// WARNING while a patient shifts around near an edge, and dropping back to the
+// ready angle on every WARNING made the servos pump up and down. A side that is
+// already higher than READY_OFFSET simply stays where it is; nothing comes down
+// until the patient is genuinely SAFE again.
+void readyPosition() {
+  safeSince = 0;
+
+  // WARNING settles BOTH sides at the braced angle, wherever they were.
+  //
+  // While an incident is running the zone swings between DANGER and WARNING:
+  //   DANGER  -> the threatened side goes to its full lift
+  //   WARNING -> that side eases back down to the braced angle
+  // and it stays braced until the patient is genuinely SAFE. Because moveTo()
+  // is skipped when a side is already at the target, a side that stays braced
+  // across several WARNING readings simply holds - no pumping.
+  if (leftOff != READY_OFFSET) {
+    moveTo(servoLeft, LEFT_START, LEFT_DIR, leftOff, READY_OFFSET,
+           leftOff < READY_OFFSET ? EASE_MS : LOWER_MS);
+    leftOff = READY_OFFSET;
+  }
+  if (rightOff != READY_OFFSET) {
+    moveTo(servoRight, RIGHT_START, RIGHT_DIR, rightOff, READY_OFFSET,
+           rightOff < READY_OFFSET ? EASE_MS : LOWER_MS);
+    rightOff = READY_OFFSET;
+  }
+  holdPosition();
+}
+
+// ── SAFE again: hold the current tilt, then return to flat ──
+// The sides stay exactly where they are for SETTLE_HOLD_MS after the patient
+// first reads SAFE, in case they move straight back towards the edge. Only
+// once that has passed do both sides ease down to flat.
+//
+// safeSince is cleared by liftLeft/liftRight/readyPosition, so any DANGER or
+// WARNING in the meantime restarts the countdown - the sides never drop while
+// the zone is still oscillating.
+void lowerAll() {
+  if (leftOff == 0 && rightOff == 0) {
+    safeSince = 0;
+    return;                                  // already flat, nothing to do
+  }
+
+  if (safeSince == 0) safeSince = millis();  // first SAFE reading: start timer
+
+  if (millis() - safeSince < (unsigned long)SETTLE_HOLD_MS) {
+    holdPosition();                          // keep the tilt while waiting
+    return;
+  }
+
+  if (leftOff != 0) {
+    moveTo(servoLeft, LEFT_START, LEFT_DIR, leftOff, 0, LOWER_MS);
+    leftOff = 0;
+  }
+  if (rightOff != 0) {
+    moveTo(servoRight, RIGHT_START, RIGHT_DIR, rightOff, 0, LOWER_MS);
+    rightOff = 0;
+  }
+  safeSince = 0;
 }
 
 // ──────────────────────────────────────────
@@ -228,15 +377,15 @@ void setup() {
   Serial.println("========================================");
 
   // ── Servo init — identical to original ──
-  servo1.setPeriodHertz(50);
-  servo2.setPeriodHertz(50);
+  servoLeft.setPeriodHertz(50);
+  servoRight.setPeriodHertz(50);
 
-  servo1.attach(18, 500, 2500);   // GP18
-  servo2.attach(19, 500, 2500);   // GP19
+  servoLeft.attach(PIN_LEFT,   500, 2500);   // GP19 -> LEFT  side
+  servoRight.attach(PIN_RIGHT, 500, 2500);   // GP18 -> RIGHT side
 
   // Snap to individual starting positions on power-up
-  servo1.writeMicroseconds(SERVO1_START);
-  servo2.writeMicroseconds(SERVO2_START);
+  servoLeft.writeMicroseconds(LEFT_START);
+  servoRight.writeMicroseconds(RIGHT_START);
 
   // Let motors physically reach their start positions
   delay(3000);
@@ -286,25 +435,42 @@ void loop() {
   // ── Act on current zone ──
   // Each action runs once per poll cycle so a zone change is picked up
   // within POLL_INTERVAL_MS instead of being buried under a long sweep.
-  if (currentZone == "DANGER_LEFT" || currentZone == "DANGER_RIGHT") {
+  if (currentZone == "DANGER_LEFT") {
     if (!actedThisCycle) {
       actedThisCycle = true;
-      Serial.println("  [ACTION] DANGER — full sweep");
-      fullSweep();
+      Serial.println("  [ACTION] DANGER_LEFT - lifting LEFT edge");
+      liftLeft();
+    } else {
+      holdPosition();
+    }
+
+  } else if (currentZone == "DANGER_RIGHT") {
+    if (!actedThisCycle) {
+      actedThisCycle = true;
+      Serial.println("  [ACTION] DANGER_RIGHT - lifting RIGHT edge");
+      liftRight();
+    } else {
+      holdPosition();
     }
 
   } else if (currentZone == "WARNING") {
+    // No full lift here - the patient is still on the bed. The sides rise
+    // partway and STAY there for as long as WARNING lasts.
     if (!actedThisCycle) {
       actedThisCycle = true;
-      Serial.println("  [ACTION] WARNING — gentle nudge");
-      gentleNudge();
+      Serial.println("  [ACTION] WARNING - sides held at ready angle");
+      readyPosition();
+    } else {
+      // actedThisCycle stops the MOVE repeating, but the servo still needs a
+      // pulse every cycle or it sags out of position under load.
+      holdPosition();
     }
 
   } else {
-    // SAFE / EMPTY / NOT_FOUND / STALE / unknown -> hold at start positions
+    // SAFE / EMPTY / NOT_FOUND / STALE / unknown -> lower both sides
     if (!actedThisCycle) {
       actedThisCycle = true;
-      goToStart();
+      lowerAll();
     }
     delay(20);   // small yield so the WiFi stack can breathe
   }

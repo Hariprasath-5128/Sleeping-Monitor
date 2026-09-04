@@ -15,6 +15,8 @@
 #include <WiFi.h>
 #include <esp_camera.h>
 #include <esp_http_server.h>
+#include <esp_arduino_version.h>   // ESP_ARDUINO_VERSION_MAJOR (LEDC API choice)
+#include <esp_wifi.h>              // esp_wifi_set_ps() - kill WiFi power save
 
 // ──────────────────────────────────────────
 // WiFi credentials  ← must match the motor ESP32 and your PC
@@ -50,6 +52,13 @@ IPAddress subnet  (255, 255, 255, 0);
 #define PCLK_GPIO_NUM     22
 
 #define LED_FLASH_GPIO     4   // on-board white flash LED
+#define LED_FLASH_CHANNEL  2   // LEDC channel (0/1 are used by the camera)
+
+// Flash LED brightness, 0-255. 0 = off.
+// The LED draws real current and runs hot, which on this board has coincided
+// with the WiFi stalls, so it stays off by default. Raise it only if the bed
+// is genuinely too dark for the camera.
+#define FLASH_BRIGHTNESS   0
 
 // Dedicated stream port, matching the reference project's server layout.
 #define STREAM_PORT 81
@@ -84,20 +93,29 @@ bool initCamera() {
   config.pin_sccb_scl = SIOC_GPIO_NUM;
   config.pin_pwdn     = PWDN_GPIO_NUM;
   config.pin_reset    = RESET_GPIO_NUM;
-  config.xclk_freq_hz = 20000000;
+  // 10 MHz rather than the usual 20 MHz: many AI-Thinker boards produce
+  // corrupt JPEGs at 20 MHz ("huffman table decode error", "overread"),
+  // especially on marginal power. Half the clock is far more reliable and
+  // still comfortably fast enough for QVGA.
+  config.xclk_freq_hz = 10000000;
   config.pixel_format = PIXFORMAT_JPEG;
 
-  // QVGA with moderate JPEG compression keeps the stream fast enough for
-  // monitoring while retaining useful detail for person/bed detection.
+  // Tuned for LATENCY, not picture quality.
+  //
+  // QQVGA (160x120) with heavy JPEG compression cuts a frame from ~4.6 KB to
+  // roughly 1-1.5 KB. Less to encode and less to push through a struggling
+  // radio means the camera answers sooner, which is the whole problem here.
+  // YOLO still works at this size for a body-sized object on a bed; raise
+  // these back up (QVGA / quality 12) once the link is healthy.
   if (psramFound()) {
-    config.frame_size   = FRAMESIZE_QVGA;  // 320x240
-    config.jpeg_quality = 18;
+    config.frame_size   = FRAMESIZE_QQVGA;  // 160x120
+    config.jpeg_quality = 35;               // higher number = smaller frame
     config.fb_count     = 2;
     config.grab_mode    = CAMERA_GRAB_LATEST;
     config.fb_location  = CAMERA_FB_IN_PSRAM;
   } else {
-    config.frame_size   = FRAMESIZE_QVGA;
-    config.jpeg_quality = 20;
+    config.frame_size   = FRAMESIZE_QQVGA;
+    config.jpeg_quality = 40;
     config.fb_count     = 1;
     config.grab_mode    = CAMERA_GRAB_LATEST;
     config.fb_location  = CAMERA_FB_IN_DRAM;
@@ -133,6 +151,12 @@ void connectWiFi() {
   WiFi.config(staticIP, gateway, subnet);
 #endif
   WiFi.setSleep(false);          // keep latency low for streaming
+  // Max transmit power: the stock setting is conservative and, on a link with
+  // any distance or interference, causes the retries that show up as multi-
+  // second response times rather than as outright packet loss.
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
+  WiFi.setAutoReconnect(true);
+  WiFi.persistent(false);        // do not rewrite flash on every connect
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
   int attempts = 0;
@@ -144,6 +168,14 @@ void connectWiFi() {
   Serial.println();
 
   if (WiFi.status() == WL_CONNECTED) {
+    // Re-apply AFTER the association completes. Setting these before
+    // WiFi.begin() is not enough — the driver reconfigures the radio when it
+    // associates, which re-enables power save. Power save is what makes the
+    // camera answer in 30 ms one moment and 1000 ms the next.
+    WiFi.setSleep(false);
+    WiFi.setTxPower(WIFI_POWER_19_5dBm);
+    esp_wifi_set_ps(WIFI_PS_NONE);   // the one that actually sticks
+
     Serial.print("  Connected! Camera IP: ");
     Serial.println(WiFi.localIP());
     Serial.print("  Stream URL  -> http://");
@@ -201,13 +233,22 @@ esp_err_t handleStream(httpd_req_t* req) {
   httpd_resp_set_hdr(req, "Cache-Control", "no-cache, no-store, must-revalidate");
   Serial.println("  [STREAM] client connected");
 
+  int grabFailures = 0;
+
   while (result == ESP_OK) {
     camera_fb_t* fb = esp_camera_fb_get();
     if (!fb) {
-      Serial.println("  [STREAM] frame grab failed");
-      result = ESP_FAIL;
-      break;
+      // A single dropped grab is normal under load. Tearing the whole stream
+      // down for one is what made the client reconnect in a loop.
+      if (++grabFailures >= 10) {
+        Serial.println("  [STREAM] camera stopped delivering frames");
+        result = ESP_FAIL;
+        break;
+      }
+      delay(20);
+      continue;
     }
+    grabFailures = 0;
 
     char part[96];
     size_t partLength = snprintf(part, sizeof(part), STREAM_PART, fb->len);
@@ -218,6 +259,11 @@ esp_err_t handleStream(httpd_req_t* req) {
     }
 
     esp_camera_fb_return(fb);
+
+    // Hand the CPU to the WiFi/TCP task without burning a fixed 5 ms per
+    // frame: at 12 fps that delay alone was capping the rate. yield() lets
+    // the stack drain and returns as soon as it is done.
+    yield();
   }
 
   Serial.println("  [STREAM] client disconnected");
@@ -253,11 +299,16 @@ void startCameraServers() {
   // httpd_start() fails and port 81 resets every connection.
   streamConfig.ctrl_port = controlConfig.ctrl_port + 1;
   streamConfig.max_uri_handlers = 1;
-  // MJPEG runs one long-lived request; a single worker with a bigger stack
-  // avoids the handler task dying mid-frame.
-  streamConfig.max_open_sockets = 2;
+  // MJPEG is ONE long-lived request. Allowing a second socket while
+  // lru_purge_enable is on makes the server evict the oldest connection -
+  // which is the live stream - so the client sees "stream ends prematurely",
+  // reconnects, gets purged again, and loops forever. One socket, no purging.
+  streamConfig.max_open_sockets = 1;
+  streamConfig.lru_purge_enable = false;
   streamConfig.stack_size = 8192;
-  streamConfig.lru_purge_enable = true;
+  // Do not let the server time out a stream that is deliberately endless.
+  streamConfig.recv_wait_timeout = 10;
+  streamConfig.send_wait_timeout = 10;
 
   httpd_uri_t streamUri = {};
   streamUri.uri = "/stream";
@@ -278,6 +329,10 @@ void startCameraServers() {
 // setup
 // ──────────────────────────────────────────
 void setup() {
+  // Run the CPU flat out. Anything less throttles both JPEG encoding and the
+  // WiFi stack, which is what turns a 5 ms request into a multi-second one.
+  setCpuFrequencyMhz(240);
+
   Serial.begin(115200);
   Serial.setDebugOutput(false);
   Serial.println();
@@ -285,8 +340,21 @@ void setup() {
   Serial.println("  Sleeping Monitor - ESP32-CAM Streamer");
   Serial.println("========================================");
 
-  pinMode(LED_FLASH_GPIO, OUTPUT);
-  digitalWrite(LED_FLASH_GPIO, LOW);   // flash off; the bed is lit by the room
+  // Flash LED on continuously to light the bed.
+  // Driven by PWM rather than digitalWrite(HIGH): at full brightness this LED
+  // pulls a lot of current and runs hot, which on a marginal supply is exactly
+  // what browns the board out mid-stream. FLASH_BRIGHTNESS is the dial.
+  //
+  // ESP32 core 3.x replaced ledcSetup()/ledcAttachPin() with a single
+  // ledcAttach(pin, freq, resolution), so pick the API the installed core has.
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcAttach(LED_FLASH_GPIO, 5000, 8);          // 5 kHz, 8-bit
+  ledcWrite(LED_FLASH_GPIO, FLASH_BRIGHTNESS);  // 3.x addresses the PIN
+#else
+  ledcSetup(LED_FLASH_CHANNEL, 5000, 8);
+  ledcAttachPin(LED_FLASH_GPIO, LED_FLASH_CHANNEL);
+  ledcWrite(LED_FLASH_CHANNEL, FLASH_BRIGHTNESS);
+#endif
 
   if (!initCamera()) {
     Serial.println("  Camera init failed - restarting in 5 s...");
