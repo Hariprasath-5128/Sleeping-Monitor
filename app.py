@@ -112,6 +112,36 @@ def get_result():
     return get_status()
 
 
+# Tilt angles most recently reported by the motor ESP32. It POSTs these each
+# time it polls, so the live view can show what the bed is actually doing
+# rather than only what the vision pipeline asked for.
+_tilt = {"left": 0.0, "right": 0.0, "zone": "", "ts": 0.0}
+
+
+@app.route("/tilt", methods=["GET", "POST"])
+def tilt():
+    """GET: current tilt. POST: the ESP32 reporting its servo angles."""
+    if request.method == "POST":
+        try:
+            _tilt["left"]  = float(request.args.get("l", 0.0))
+            _tilt["right"] = float(request.args.get("r", 0.0))
+            _tilt["zone"]  = request.args.get("z", "")
+            _tilt["ts"]    = time.time()
+            return jsonify({"ok": True})
+        except (TypeError, ValueError):
+            return jsonify({"ok": False}), 400
+
+    age = time.time() - _tilt["ts"] if _tilt["ts"] else -1.0
+    return jsonify({
+        "left": round(_tilt["left"], 1),
+        "right": round(_tilt["right"], 1),
+        "zone": _tilt["zone"],
+        # The motor has not reported recently, so treat the reading as unknown.
+        "stale": age < 0 or age > 5.0,
+        "age_s": round(age, 2) if age >= 0 else -1.0,
+    })
+
+
 @app.route("/health")
 def health():
     return jsonify({"ok": True, "ts": time.time()})
@@ -210,6 +240,8 @@ def live():
         "a{color:#0cf}</style>"
         "<h2>Sleeping Monitor &mdash; Live</h2>"
         "<p>Zone: <span id='z'>…</span></p>"
+        "<p id='tilt' style='font-size:1.1em'>Tilt &nbsp; "
+        "LEFT <b id='tl'>--</b>&deg; &nbsp;&nbsp; RIGHT <b id='tr'>--</b>&deg;</p>"
         "<img id='v' alt='live view'>"
         "<p style='opacity:.7;font-size:.9em'>Click the 4 bed corners in the "
         "<b>Select 4 Corners</b> window on the PC running img_process.py; "
@@ -234,7 +266,16 @@ def live():
         "setInterval(async()=>{try{"
         "const r=await fetch('/status');const j=await r.json();"
         "document.getElementById('z').textContent=j.status;"
-        "}catch(e){}},1000);</script>"
+        "}catch(e){}"
+        "try{"
+        "const t=await(await fetch('/tilt')).json();"
+        "const L=document.getElementById('tl'),R=document.getElementById('tr');"
+        "if(t.stale){L.textContent='--';R.textContent='--';}"
+        "else{L.textContent=t.left.toFixed(0);R.textContent=t.right.toFixed(0);"
+        "L.style.color=t.left>5?'#f66':'#6f6';"
+        "R.style.color=t.right>5?'#f66':'#6f6';}"
+        "}catch(e){}"
+        "},1000);</script>"
     )
 
 

@@ -89,6 +89,9 @@ LIVE_EVERY_N = 2        # publish every N frames
 LIVE_QUALITY = 70       # JPEG quality for the web view
 # Where app.py is listening; frames are POSTed here for /video.
 LIVE_POST_URL = os.environ.get("LIVE_POST_URL", "http://127.0.0.1:5000/frame")
+# Where to read the bed's real tilt (reported by the motor ESP32).
+TILT_URL = os.environ.get("TILT_URL", "http://127.0.0.1:5000/tilt")
+TILT_POLL_EVERY_N = 10        # frames between tilt refreshes
 
 # How often to rebuild the capture connection while frames are not arriving.
 REOPEN_EVERY_S = 15.0
@@ -1124,6 +1127,30 @@ def publish_frame(img):
             pass
 
 
+# Latest tilt reported by the motor ESP32, fetched from app.py.
+tilt_state = {"left": 0.0, "right": 0.0, "stale": True}
+_tilt_session = None
+
+
+def fetch_tilt():
+    """Read the bed's real tilt from app.py. Never blocks for long."""
+    global _tilt_session
+    try:
+        if _tilt_session is None:
+            import requests
+            _tilt_session = requests.Session()
+        r = _tilt_session.get(TILT_URL, timeout=0.4)
+        if r.status_code == 200:
+            d = r.json()
+            tilt_state["left"]  = float(d.get("left", 0.0))
+            tilt_state["right"] = float(d.get("right", 0.0))
+            tilt_state["stale"] = bool(d.get("stale", True))
+            return
+    except Exception:
+        pass
+    tilt_state["stale"] = True
+
+
 def zone_from_geometry(cx_w, lz, rz, tracking, bx=None, bw=None):
     """Derive the zone from how much of the body has crossed a boundary.
 
@@ -1214,6 +1241,7 @@ frame_no     = 0
 log_counter  = 0
 status_counter = 0
 live_counter = 0
+tilt_counter = 0
 read_fail    = 0
 last_fail_report = 0.0
 last_reopen      = time.time()
@@ -1642,6 +1670,22 @@ while True:
         ts_col = (0, 180, 255)
     cv2.putText(display, ts_txt, (10, 22),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.55, ts_col, 2, cv2.LINE_AA)
+
+    # ── Bed tilt, as reported by the motor ESP32 ──
+    tilt_counter += 1
+    if tilt_counter >= TILT_POLL_EVERY_N:
+        tilt_counter = 0
+        fetch_tilt()
+
+    if tilt_state["stale"]:
+        tilt_txt, tilt_col = "TILT  --  /  --", (140, 140, 140)
+    else:
+        tilt_txt = "TILT  L %.0f%s  R %.0f%s" % (
+            tilt_state["left"], chr(176), tilt_state["right"], chr(176))
+        raised = max(tilt_state["left"], tilt_state["right"]) > 5.0
+        tilt_col = (0, 200, 255) if raised else (0, 220, 0)
+    cv2.putText(display, tilt_txt, (10, 44),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.55, tilt_col, 2, cv2.LINE_AA)
 
     # ── Status bar ──
     if not sticky_warn:

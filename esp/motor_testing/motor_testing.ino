@@ -45,7 +45,7 @@ const int RIGHT_START = 1000;   // GP18 rest
 //     1200 us ~= 108 deg  (side panel swung a full 90 deg - too far)
 //      915 us ~=  82 deg  - steep enough to block a fall, backed off from
 //                            fully vertical so the panel does not overshoot.
-const int TRAVEL_MAX   = 915;    // us of travel for a full lift
+const int TRAVEL_MAX   = 726;    // us of travel for a full lift (~65 deg)
 
 // If the zone is STILL danger once the side is at TRAVEL_MAX, push this much
 // further - and no further. A last 10 deg of persuasion, not a second lift.
@@ -393,21 +393,13 @@ void setup() {
   servoLeft.attach(PIN_LEFT,   500, 2500);   // GP19 -> LEFT  side
   servoRight.attach(PIN_RIGHT, 500, 2500);   // GP18 -> RIGHT side
 
-  // COLD START - ease into position instead of snapping.
-  //
-  // Writing the target straight away makes the servo slam there at full speed
-  // the instant it powers up. Start from a small lift and walk down to flat on
-  // the servo's own 20 ms cadence, so the panels settle smoothly.
-  const int COLD_START_OFF = 220;          // begin ~20 deg up
-  servoLeft.writeMicroseconds(LEFT_START + LEFT_DIR * COLD_START_OFF);
-  servoRight.writeMicroseconds(RIGHT_START + RIGHT_DIR * COLD_START_OFF);
-  delay(600);                               // let them reach that gently
-
-  moveTo(servoLeft,  LEFT_START,  LEFT_DIR,  COLD_START_OFF, 0, 1500);
-  moveTo(servoRight, RIGHT_START, RIGHT_DIR, COLD_START_OFF, 0, 1500);
+  // Snap to the flat resting position on power-up.
+  servoLeft.writeMicroseconds(LEFT_START);
+  servoRight.writeMicroseconds(RIGHT_START);
   leftOff = rightOff = 0;
 
-  Serial.println("  Servos eased to start positions.");
+  delay(3000);                              // let the motors physically arrive
+  Serial.println("  Servos at start positions.");
 
   // ── WiFi ──
   connectWiFi();
