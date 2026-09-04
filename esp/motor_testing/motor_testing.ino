@@ -43,15 +43,19 @@ const int RIGHT_START = 1000;   // GP18 rest
 // Lift travel. With attach(500, 2500) the servo spans 180 deg over 2000 us,
 // so roughly 11 us per degree:
 //     1200 us ~= 108 deg  (side panel swung a full 90 deg - too far)
-//      860 us ~=  77 deg  - steep enough to block a fall, backed off from
+//      915 us ~=  82 deg  - steep enough to block a fall, backed off from
 //                            fully vertical so the panel does not overshoot.
-const int TRAVEL_MAX   = 860;    // us of travel for a full lift
+const int TRAVEL_MAX   = 915;    // us of travel for a full lift
+
+// If the zone is STILL danger once the side is at TRAVEL_MAX, push this much
+// further - and no further. A last 10 deg of persuasion, not a second lift.
+const int DANGER_EXTRA = 111;    // us (~10 deg)
 
 // WARNING angle. The sides rise this far and STAY there while the patient is
 // near an edge - braced and ready - without attempting to tilt them back.
-// ~620 us is about 56 deg: the angle the sides SIT at while braced. Raised
+// ~675 us is about 61 deg: the angle the sides SIT at while braced. Raised
 // so a braced side genuinely resists a roll rather than just leaning in.
-const int READY_OFFSET = 620;    // us
+const int READY_OFFSET = 675;    // us
 
 // Once the patient is back in the safe zone the sides HOLD their current
 // tilt for this long before returning to flat, in case the patient moves
@@ -148,13 +152,15 @@ void holdPosition() {
 // near an edge cannot make the servos oscillate.
 void liftLeft() {
   safeSince = 0;                     // no longer safe; restart the settle timer
-  if (leftOff < TRAVEL_MAX) {
-    moveTo(servoLeft, LEFT_START, LEFT_DIR, leftOff, TRAVEL_MAX, LIFT_MS);
-    leftOff = TRAVEL_MAX;
+
+  // Still in danger while already at full lift? Push the last 10 deg, once.
+  int target = (leftOff >= TRAVEL_MAX) ? (TRAVEL_MAX + DANGER_EXTRA)
+                                       : TRAVEL_MAX;
+  if (leftOff < target) {
+    moveTo(servoLeft, LEFT_START, LEFT_DIR, leftOff, target, LIFT_MS);
+    leftOff = target;
   }
-  // The RIGHT side goes FULLY FLAT. WARNING raises both sides, so without
-  // this the opposite edge is still standing at the ready angle and the bed
-  // looks tilted on both sides instead of dipping towards the safe side.
+  // The RIGHT side goes FULLY FLAT so the bed leans away from the danger.
   if (rightOff != 0) {
     moveTo(servoRight, RIGHT_START, RIGHT_DIR, rightOff, 0, LOWER_MS);
     rightOff = 0;
@@ -164,17 +170,20 @@ void liftLeft() {
 
 void liftRight() {
   safeSince = 0;
-  if (rightOff < TRAVEL_MAX) {
-    moveTo(servoRight, RIGHT_START, RIGHT_DIR, rightOff, TRAVEL_MAX, LIFT_MS);
-    rightOff = TRAVEL_MAX;
+
+  int target = (rightOff >= TRAVEL_MAX) ? (TRAVEL_MAX + DANGER_EXTRA)
+                                        : TRAVEL_MAX;
+  if (rightOff < target) {
+    moveTo(servoRight, RIGHT_START, RIGHT_DIR, rightOff, target, LIFT_MS);
+    rightOff = target;
   }
-  // LEFT side fully flat, so only the right edge is raised.
   if (leftOff != 0) {
     moveTo(servoLeft, LEFT_START, LEFT_DIR, leftOff, 0, LOWER_MS);
     leftOff = 0;
   }
   holdPosition();
 }
+
 
 // ── WARNING: brace both sides and STAY braced ──
 // The patient is still on the bed, so a full lift would achieve nothing. Both
@@ -185,36 +194,37 @@ void liftRight() {
 // ready angle on every WARNING made the servos pump up and down. A side that is
 // already higher than READY_OFFSET simply stays where it is; nothing comes down
 // until the patient is genuinely SAFE again.
-void readyPosition() {
+// Brace ONE side at the ready angle; the other goes flat.
+//
+// The zone now names the side (WARNING_LEFT / WARNING_RIGHT), so only the
+// threatened edge is raised. Raising both meant the opposite motor moved for
+// no reason, and the bed rose evenly instead of leaning away from the edge.
+void braceSide(bool left) {
   safeSince = 0;
 
-  // WARNING settles BOTH sides at the braced angle, wherever they were.
-  //
-  // While an incident is running the zone swings between DANGER and WARNING:
-  //   DANGER  -> the threatened side goes to its full lift
-  //   WARNING -> that side eases back down to the braced angle
-  // and it stays braced until the patient is genuinely SAFE. Because moveTo()
-  // is skipped when a side is already at the target, a side that stays braced
-  // across several WARNING readings simply holds - no pumping.
-  if (leftOff != READY_OFFSET) {
-    moveTo(servoLeft, LEFT_START, LEFT_DIR, leftOff, READY_OFFSET,
-           leftOff < READY_OFFSET ? EASE_MS : LOWER_MS);
-    leftOff = READY_OFFSET;
+  int wantLeft  = left ? READY_OFFSET : 0;
+  int wantRight = left ? 0 : READY_OFFSET;
+
+  if (leftOff != wantLeft) {
+    moveTo(servoLeft, LEFT_START, LEFT_DIR, leftOff, wantLeft,
+           leftOff < wantLeft ? EASE_MS : LOWER_MS);
+    leftOff = wantLeft;
   }
-  if (rightOff != READY_OFFSET) {
-    moveTo(servoRight, RIGHT_START, RIGHT_DIR, rightOff, READY_OFFSET,
-           rightOff < READY_OFFSET ? EASE_MS : LOWER_MS);
-    rightOff = READY_OFFSET;
+  if (rightOff != wantRight) {
+    moveTo(servoRight, RIGHT_START, RIGHT_DIR, rightOff, wantRight,
+           rightOff < wantRight ? EASE_MS : LOWER_MS);
+    rightOff = wantRight;
   }
   holdPosition();
 }
+
 
 // ── SAFE again: hold the current tilt, then return to flat ──
 // The sides stay exactly where they are for SETTLE_HOLD_MS after the patient
 // first reads SAFE, in case they move straight back towards the edge. Only
 // once that has passed do both sides ease down to flat.
 //
-// safeSince is cleared by liftLeft/liftRight/readyPosition, so any DANGER or
+// safeSince is cleared by liftLeft/liftRight/braceSide, so any DANGER or
 // WARNING in the meantime restarts the countdown - the sides never drop while
 // the zone is still oscillating.
 void lowerAll() {
@@ -383,13 +393,21 @@ void setup() {
   servoLeft.attach(PIN_LEFT,   500, 2500);   // GP19 -> LEFT  side
   servoRight.attach(PIN_RIGHT, 500, 2500);   // GP18 -> RIGHT side
 
-  // Snap to individual starting positions on power-up
-  servoLeft.writeMicroseconds(LEFT_START);
-  servoRight.writeMicroseconds(RIGHT_START);
+  // COLD START - ease into position instead of snapping.
+  //
+  // Writing the target straight away makes the servo slam there at full speed
+  // the instant it powers up. Start from a small lift and walk down to flat on
+  // the servo's own 20 ms cadence, so the panels settle smoothly.
+  const int COLD_START_OFF = 220;          // begin ~20 deg up
+  servoLeft.writeMicroseconds(LEFT_START + LEFT_DIR * COLD_START_OFF);
+  servoRight.writeMicroseconds(RIGHT_START + RIGHT_DIR * COLD_START_OFF);
+  delay(600);                               // let them reach that gently
 
-  // Let motors physically reach their start positions
-  delay(3000);
-  Serial.println("  Servos at start positions.");
+  moveTo(servoLeft,  LEFT_START,  LEFT_DIR,  COLD_START_OFF, 0, 1500);
+  moveTo(servoRight, RIGHT_START, RIGHT_DIR, COLD_START_OFF, 0, 1500);
+  leftOff = rightOff = 0;
+
+  Serial.println("  Servos eased to start positions.");
 
   // ── WiFi ──
   connectWiFi();
@@ -453,13 +471,16 @@ void loop() {
       holdPosition();
     }
 
-  } else if (currentZone == "WARNING") {
-    // No full lift here - the patient is still on the bed. The sides rise
-    // partway and STAY there for as long as WARNING lasts.
+  } else if (currentZone == "WARNING_LEFT" || currentZone == "WARNING_RIGHT") {
+    // No full lift here - the patient is still on the bed. Only the
+    // threatened side braces, and it stays there while WARNING lasts.
     if (!actedThisCycle) {
       actedThisCycle = true;
-      Serial.println("  [ACTION] WARNING - sides held at ready angle");
-      readyPosition();
+      bool left = (currentZone == "WARNING_LEFT");
+      Serial.print("  [ACTION] WARNING - bracing ");
+      Serial.print(left ? "LEFT" : "RIGHT");
+      Serial.println(" side");
+      braceSide(left);
     } else {
       // actedThisCycle stops the MOVE repeating, but the servo still needs a
       // pulse every cycle or it sags out of position under load.

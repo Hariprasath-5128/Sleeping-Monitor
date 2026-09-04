@@ -175,7 +175,7 @@ STATE_MODEL    = os.environ.get(
 # Side (left vs right) comes from the tracked centroid, not the model.
 RISK_ALIASES   = {
     "STABLE":        "SAFE",
-    "DRIFT WARNING": "WARNING",
+    "DRIFT WARNING": "WARNING",   # side filled in from geometry below
     "FALL IMMINENT": "DANGER",     # resolved to DANGER_LEFT / DANGER_RIGHT
 }
 
@@ -413,7 +413,7 @@ def draw_person(canvas, bx, by, bw, bh, cx_w, cy_w,
         box_col  = (0, 255, 80)
         text_col = (0, 220, 80)
         status   = "SAFE"
-    elif zone == "WARNING":
+    elif zone.startswith("WARNING"):
         box_col  = (0, 220, 255)
         text_col = (0, 200, 255)
         status   = "WARNING"
@@ -1159,25 +1159,15 @@ def zone_from_geometry(cx_w, lz, rz, tracking, bx=None, bw=None):
     if over_right >= DANGER_OVERLAP_FRAC:
         return "DANGER_RIGHT"
 
-    # A smaller share is a lean worth bracing for.
-    if max(over_left, over_right) >= WARN_OVERLAP_FRAC:
-        return "WARNING"
+    # A smaller share is a lean worth bracing for — and the side matters, so
+    # that only the threatened edge is raised.
+    if over_left >= WARN_OVERLAP_FRAC and over_left >= over_right:
+        return "WARNING_LEFT"
+    if over_right >= WARN_OVERLAP_FRAC:
+        return "WARNING_RIGHT"
 
     return "SAFE"
 
-    left, right = bx, bx + bw
-
-    # How far past each boundary the body reaches, as a fraction of its width.
-    over_left  = max(0, lz - left)  / float(bw)
-    over_right = max(0, right - rz) / float(bw)
-
-    # A genuine lean puts a real share of the body over the line. A wide box
-    # merely clipping the strip by a few percent is someone lying across the
-    # bed, not someone falling off it.
-    if max(over_left, over_right) >= WARN_OVERLAP_FRAC:
-        return "WARNING"
-
-    return "SAFE"
 
 # ── Corner selection ──
 print("  Click the 4 corners of the bed/box surface.")
@@ -1458,8 +1448,19 @@ while True:
             raw_zone = geo_zone
         # The classifier reports risk, not proximity. Geometry supplies the
         # near-edge WARNING that earns a gentle nudge before a full sweep.
-        elif raw_zone == "SAFE" and geo_zone == "WARNING":
-            raw_zone = "WARNING"
+        elif raw_zone == "SAFE" and geo_zone.startswith("WARNING"):
+            raw_zone = geo_zone
+        elif raw_zone == "WARNING":
+            # The classifier has no notion of side. Prefer geometry's verdict;
+            # otherwise decide from which boundary the body is nearer. The old
+            # code defaulted to WARNING_LEFT, which braced the wrong motor for
+            # anything happening on the right.
+            if geo_zone.startswith("WARNING"):
+                raw_zone = geo_zone
+            else:
+                mid = (LZ + RZ) / 2.0
+                raw_zone = ("WARNING_LEFT" if chosen["cx"] < mid
+                            else "WARNING_RIGHT")
 
         # GEOMETRY HAS THE FINAL SAY ON DANGER.
         #
@@ -1560,14 +1561,19 @@ while True:
                         label=last_label.upper())
 
     # Sticky warning logic from classification
-    if current_zone in ("DANGER_LEFT", "DANGER_RIGHT", "WARNING", "NOT_FOUND"):
+    # NOT_FOUND is deliberately NOT an alarm state. YOLO drops the object for
+    # a few frames all the time; treating that as "may have fallen" produced
+    # constant false alerts while the object was plainly on the bed.
+    if (current_zone.startswith("DANGER") or current_zone.startswith("WARNING")):
         sticky_warn = True
         if current_zone == "DANGER_LEFT":
             sticky_msg = "<-- ABOUT TO FALL LEFT"
         elif current_zone == "DANGER_RIGHT":
             sticky_msg = "ABOUT TO FALL RIGHT -->"
-        elif current_zone == "NOT_FOUND":
-            sticky_msg = "!! OBJECT NOT FOUND — MAY HAVE FALLEN !!"
+        elif current_zone == "WARNING_LEFT":
+            sticky_msg = "WARNING: NEAR LEFT EDGE"
+        elif current_zone == "WARNING_RIGHT":
+            sticky_msg = "WARNING: NEAR RIGHT EDGE"
         else:
             sticky_msg = "WARNING: NEAR EDGE"
         sticky_zone = current_zone
@@ -1607,8 +1613,8 @@ while True:
     elif sticky_zone == "EMPTY":
         badge_text = "EMPTY BED"
         badge_col  = (150, 150, 150)
-    elif sticky_zone == "WARNING":
-        badge_text = "WARNING"
+    elif sticky_zone.startswith("WARNING"):
+        badge_text = sticky_zone.replace("_", " ")
         badge_col  = (0, 200, 255)
     elif sticky_zone == "NOT_FOUND":
         badge_text = "NOT FOUND"
@@ -1639,11 +1645,13 @@ while True:
 
     # ── Status bar ──
     if not sticky_warn:
-        s_text = "PATIENT SAFE"
-        s_col  = (50, 220, 50)
-    elif sticky_zone == "NOT_FOUND":
-        s_text = "OBJECT NOT FOUND — MAY HAVE FALLEN OFF BED"
-        s_col  = (0, 100, 255)
+        # Searching for the object is not an alarm; say so plainly.
+        if sticky_zone == "NOT_FOUND":
+            s_text = "SEARCHING FOR PATIENT..."
+            s_col  = (180, 180, 180)
+        else:
+            s_text = "PATIENT SAFE"
+            s_col  = (50, 220, 50)
     else:
         s_text = "!! PATIENT AT RISK — ABOUT TO FALL !!"
         s_col  = (60, 60, 255)
