@@ -1,18 +1,34 @@
-
-# Python caches
+# ── Python ──
 __pycache__/
-*.pyc
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
 
-# Logs
-position_log.csv
-
-# Runtime status published by img_process.py
+# ── Runtime state written by the pipeline ──
+# img_process.py publishes these every frame; app.py serves them to the ESP32.
 status.json
 status.json.tmp
 status.txt
-
-# Federated learning local store
-fl_store/
-
 live_frame.jpg
 live_frame.jpg.tmp
+position_log.csv
+
+# ── Federated learning store ──
+# Locally trained and aggregated models; regenerated on every run.
+fl_store/
+
+# ── Training data and generated media ──
+# The IR dataset and the animations built from it are large and reproducible
+# from tools/. Keep them out of the repo.
+data/
+labeled_zone_dataset/
+dataset/
+dataset_split/
+runs/
+*.gif
+
+# ── Scratch ──
+test.jpg
+*.bak
+*.tmp
