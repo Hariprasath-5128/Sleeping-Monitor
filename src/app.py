@@ -25,7 +25,8 @@ from flask import Flask, Response, jsonify, request
 
 app = Flask(__name__)
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# src/ holds the scripts; runtime state and models live at the repo root.
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 STATUS_JSON = os.path.join(BASE_DIR, "status.json")
 STATUS_TXT = os.path.join(BASE_DIR, "status.txt")   # legacy plain-text fallback
 # Annotated frame published by img_process.py for the browser view.

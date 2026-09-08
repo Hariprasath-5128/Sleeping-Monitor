@@ -21,10 +21,10 @@
     3. Close any browser tab showing the camera stream (:81/stream).
 
     4. Terminal 1:    cd C:\Projects\sleeping-monitor
-                      python app.py
+                      python srcpp.py
 
     5. Terminal 2:    cd C:\Projects\sleeping-monitor
-                      python img_process.py
+                      python src\img_process.py
 
     6. Click the 4 bed corners:   TL -> TR -> BR -> BL
        (top-left, top-right, bottom-right, bottom-left - clockwise)
@@ -118,9 +118,9 @@
   Run this to print every value that must be correct:
 
       cd C:\Projects\sleeping-monitor
-      findstr /N /C:"CAM_IP" img_process.py
-      findstr /N /C:"SERVER_IP" esp\motor_testing\motor_testing.ino
-      findstr /N /C:"WIFI_SSID" esp\live_monitor\live_monitor.ino esp\motor_testing\motor_testing.ino
+      findstr /N /C:"CAM_IP" src\img_process.py
+      findstr /N /C:"SERVER_IP" firmware\motor_testing\motor_testing.ino
+      findstr /N /C:"WIFI_SSID" firmware\live_monitor\live_monitor.ino firmware\motor_testing\motor_testing.ino
 
   Expected values right now:
 
@@ -175,7 +175,7 @@
   1. Turn ON the "Hariprasath LAPTOP" hotspot first.
 
   2. Arduino IDE - open:
-         C:\Projects\sleeping-monitor\esp\live_monitor\live_monitor.ino
+         C:\Projects\sleeping-monitor\firmware\live_monitor\live_monitor.ino
 
   3. Tools menu settings:
          Board       : "AI Thinker ESP32-CAM"
@@ -227,7 +227,7 @@
 ===============================================================================
 
       cd C:\Projects\sleeping-monitor
-      python app.py
+      python srcpp.py
 
   Expected output:
 
@@ -252,7 +252,7 @@
 ===============================================================================
 
   1. Arduino IDE - open:
-         C:\Projects\sleeping-monitor\esp\motor_testing\motor_testing.ino
+         C:\Projects\sleeping-monitor\firmware\motor_testing\motor_testing.ino
 
   2. Tools menu:
          Board : "ESP32 Dev Module"
@@ -295,7 +295,7 @@
   Open a SECOND terminal (leave app.py running in the first):
 
       cd C:\Projects\sleeping-monitor
-      python img_process.py
+      python src\img_process.py
 
   Expected startup:
 
@@ -315,7 +315,7 @@
   To force the capture fallback on purpose:
 
       set CAM_PORT=80
-      python img_process.py
+      python src\img_process.py
 
 
 ===============================================================================
@@ -471,18 +471,18 @@
   TERMINAL 3 - the aggregation server:
 
       cd C:\Projects\sleeping-monitor
-      python fl_server.py
+      python srcl_server.py
 
   It listens on port 8081 and waits for 2 clients by default.
   On a single machine, make it aggregate after just one upload:
 
       set FL_MIN_CLIENTS=1
-      python fl_server.py
+      python srcl_server.py
 
   TERMINAL 4 - the client (one per bed):
 
       cd C:\Projects\sleeping-monitor
-      python fl_client.py
+      python srcl_client.py
 
   What it does:
       1. Trains a risk classifier on THIS bed's position_log.csv
@@ -493,9 +493,9 @@
 
   Other client options:
 
-      python fl_client.py --loop 600      repeat every 10 minutes
-      python fl_client.py --pull-only     only download the global model
-      python fl_client.py --server http://192.168.137.1:8081
+      python srcl_client.py --loop 600      repeat every 10 minutes
+      python srcl_client.py --pull-only     only download the global model
+      python srcl_client.py --server http://192.168.137.1:8081
 
   >> Restart img_process.py afterwards to load the new brain. <<
 
@@ -512,10 +512,10 @@
   Close any browser tab showing  :81/stream
 
   Terminal 1:   cd C:\Projects\sleeping-monitor
-                python app.py
+                python srcpp.py
 
   Terminal 2:   cd C:\Projects\sleeping-monitor
-                python img_process.py
+                python src\img_process.py
 
   Then:         click 4 corners  TL -> TR -> BR -> BL
                 adjust the LEFT/RIGHT sliders

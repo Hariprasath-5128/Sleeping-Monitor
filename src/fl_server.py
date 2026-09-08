@@ -36,7 +36,8 @@ from flask import Flask, jsonify, request, send_file
 
 app = Flask(__name__)
 
-BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
+# src/ holds the scripts; runtime state and models live at the repo root.
+BASE_DIR   = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 FL_DIR     = os.path.join(BASE_DIR, "fl_store")
 GLOBAL_PKL = os.path.join(FL_DIR, "global_model.pkl")
 HISTORY    = os.path.join(FL_DIR, "fl_history.json")

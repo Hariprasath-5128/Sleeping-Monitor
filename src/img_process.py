@@ -75,15 +75,15 @@ FALLBACK_SOURCE = None if os.environ.get("NO_WEBCAM_FALLBACK", "1") == "1" else 
 
 # ── Local status server (app.py) ──
 # img_process.py writes the zone here; app.py serves it to the motor ESP32.
-STATUS_JSON = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+STATUS_JSON = os.path.join(_HERE,
                            "status.json")
-STATUS_TXT  = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+STATUS_TXT  = os.path.join(_HERE,
                            "status.txt")   # legacy plain-text mirror
 STATUS_EVERY_N = 2      # write the status file every N frames
 
 # Live view — img_process.py drops its annotated frame here and app.py serves
 # it at /video, so the bed can be watched (and corners set) from the browser.
-LIVE_FRAME  = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+LIVE_FRAME  = os.path.join(_HERE,
                            "live_frame.jpg")
 LIVE_EVERY_N = 2        # publish every N frames
 LIVE_QUALITY = 70       # JPEG quality for the web view
@@ -119,7 +119,7 @@ PROBE_ATTEMPTS    = int(os.environ.get("PROBE_ATTEMPTS", "3"))
 WARP_SIZE      = 640    # internal bird's-eye canvas — also optimal YOLO input size
 TRAIL_LEN      = 80     # centroid history for the trail
 LOG_EVERY_N    = 5      # CSV rows written every N frames
-LOG_FILE       = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+LOG_FILE       = os.path.join(_HERE,
                               "position_log.csv")
 FLASH_INTERVAL = 0.4    # warning blink period (s)
 LOST_TIMEOUT   = 60     # frames without a detection before re-acquiring
@@ -138,14 +138,16 @@ WARN_OVERLAP_FRAC = 0.15
 # inside long after the patient is really going over).
 DANGER_OVERLAP_FRAC = 0.38
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
+# The scripts live in src/; models, logs and runtime state sit at the
+# repository root, one level up.
+_HERE = os.path.dirname(_HERE)
 
 # Dual-Model System — both models come from commit 8e887afd
 # ("Final working software part").
 #
 # 1. Visual tracking model (draws the box): yolov8s.pt, committed at the repo
 #    root so tracking works with no download.
-YOLO_MODEL     = os.environ.get("YOLO_MODEL", os.path.join(_HERE, "yolov8s.pt"))
+YOLO_MODEL     = os.environ.get("YOLO_MODEL", os.path.join(_HERE, "models", "yolov8s.pt"))
 YOLO_CONF      = 0.20
 YOLO_IOU       = 0.45
 

@@ -33,7 +33,8 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
 
-BASE_DIR   = os.path.dirname(os.path.abspath(__file__))
+# src/ holds the scripts; runtime state and models live at the repo root.
+BASE_DIR   = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CSV_PATH   = os.path.join(BASE_DIR, "position_log.csv")
 LIVE_MODEL = os.path.join(BASE_DIR, "backend", "models", "risk_classifier.pkl")
 LOCAL_PKL  = os.path.join(BASE_DIR, "fl_store", "local_model.pkl")
