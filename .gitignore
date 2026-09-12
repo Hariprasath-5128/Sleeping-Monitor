@@ -19,10 +19,9 @@ position_log.csv
 fl_store/
 
 # ── Training data and generated media ──
-# The IR dataset and the animations built from it are large and reproducible
+# The datasets and animations built from them are large and reproducible
 # from tools/. Keep them out of the repo.
 data/
-labeled_zone_dataset/
 dataset/
 dataset_split/
 runs/

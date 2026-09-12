@@ -44,7 +44,6 @@ firmware/     Arduino sketches
 models/       weights used at runtime
   yolov8s.pt        object detector used for tracking
   yolov8n.pt        smaller detector, offline fallback
-  zone_model_cnn.pt zone classifier (trained by tools/train_zone_cnn.py)
 
 backend/      risk classifier and adaptive engine
   models/risk_classifier.pkl   the live "brain" (RandomForest)
